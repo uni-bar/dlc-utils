@@ -10,6 +10,7 @@ import json
 import random
 import shutil
 import subprocess
+from hashlib import sha1
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -139,6 +140,10 @@ class VideoOverlayPlayer(QMainWindow):
         self.retrain_log_handle = None
         self.retrain_log_path = None
         self.retrain_helper_script = Path(__file__).with_name("retrain_dlc_from_manual_labels.py")
+        # Default shared manual-labels root in the source/app folder if user does not choose one.
+        self.default_manual_labels_root = Path(__file__).resolve().parent / "manual_labels"
+        self._flattened_manual_labels_roots = set()
+        self.manual_edit_confidence = 0.6
         
         # Timer for playback
         self.timer = QTimer()
@@ -287,6 +292,16 @@ class VideoOverlayPlayer(QMainWindow):
         clear_point_row.addWidget(self.clear_point_combo, 1)
         clear_point_row.addWidget(self.clear_point_btn)
         edit_layout.addLayout(clear_point_row)
+
+        manual_labels_row = QHBoxLayout()
+        self.manual_labels_root_input = QLineEdit(str(self.default_manual_labels_root))
+        self.manual_labels_root_input.setPlaceholderText("Shared manual labels root folder")
+        self.manual_labels_root_input.editingFinished.connect(self.on_manual_labels_root_changed)
+        manual_labels_browse_btn = QPushButton("Browse")
+        manual_labels_browse_btn.clicked.connect(self.browse_manual_labels_root)
+        manual_labels_row.addWidget(self.manual_labels_root_input)
+        manual_labels_row.addWidget(manual_labels_browse_btn)
+        edit_layout.addLayout(manual_labels_row)
         
         self.edit_status_label = QLabel("Tip: turn Edit ON, then drag points on the frame.")
         self.edit_status_label.setWordWrap(True)
@@ -597,9 +612,37 @@ class VideoOverlayPlayer(QMainWindow):
         if folder_path:
             self.retrain_model_path_input.setText(folder_path)
             self.save_preferences()
+
+    def browse_manual_labels_root(self):
+        """Select shared root folder used to store manual labels from all edited videos."""
+        start_dir = str(Path.home())
+        current_text = self.manual_labels_root_input.text().strip()
+        if current_text:
+            current_path = Path(current_text).expanduser()
+            if current_path.exists():
+                start_dir = str(current_path if current_path.is_dir() else current_path.parent)
+            elif current_path.parent.exists():
+                start_dir = str(current_path.parent)
+
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select shared manual labels root",
+            start_dir
+        )
+        if folder_path:
+            self.manual_labels_root_input.setText(folder_path)
+            # Refresh on-screen export path for currently loaded video.
+            self.init_manual_export_paths(create_dirs=False)
+            self.save_preferences()
+
+    def on_manual_labels_root_changed(self):
+        """Persist manually typed labels root and refresh current export path preview."""
+        self.init_manual_export_paths(create_dirs=False)
+        self.save_preferences()
     
     def open_export_folder(self):
         """Open manual_labels export folder in file browser."""
+        self.init_manual_export_paths(create_dirs=True)
         if self.export_root is None:
             self.set_edit_status("Export folder not available yet. Load files first.", is_error=True)
             return
@@ -658,22 +701,71 @@ class VideoOverlayPlayer(QMainWindow):
             self.persist_dlc_edits()
             self.set_edit_status("Edit mode OFF.")
     
-    def init_manual_export_paths(self):
-        """Create output folders for edited frames and per-frame label text."""
+    def get_configured_manual_labels_root(self, create_dirs: bool = False) -> Optional[Path]:
+        """Resolve shared manual labels root from UI input."""
+        root_text = self.manual_labels_root_input.text().strip() if hasattr(self, "manual_labels_root_input") else ""
+        root_path = Path(root_text).expanduser() if root_text else self.default_manual_labels_root.expanduser()
+        try:
+            if root_path.exists():
+                if not root_path.is_dir():
+                    self.set_edit_status("Manual labels root is not a directory.", is_error=True)
+                    return None
+                return root_path.resolve()
+            if create_dirs:
+                root_path.mkdir(parents=True, exist_ok=True)
+                return root_path.resolve()
+            return root_path
+        except Exception as e:
+            self.set_edit_status(f"Manual labels root unavailable: {e}", is_error=True)
+            return None
+
+    @staticmethod
+    def _safe_name_token(text: str) -> str:
+        safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in text)
+        safe = safe.strip("_")
+        return safe or "video"
+
+    def get_current_video_export_prefix(self) -> str:
+        """Build stable per-video prefix to avoid filename collisions in shared export pool."""
         if not self.video_path:
-            return
-        base_dir = Path(self.video_path).parent / "manual_labels" / Path(self.video_path).stem
-        self.export_root = base_dir
-        self.export_frames_dir = base_dir / "images" / "train"
-        self.export_labels_dir = base_dir / "labels" / "train"
-        self.export_log_path = base_dir / "edits_log.csv"
-        
-        self.export_frames_dir.mkdir(parents=True, exist_ok=True)
-        self.export_labels_dir.mkdir(parents=True, exist_ok=True)
-        self.export_log_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        if not self.export_log_path.exists():
-            with open(self.export_log_path, "w", newline="", encoding="utf-8") as f:
+            return "video"
+        video_path_obj = Path(self.video_path).expanduser()
+        try:
+            video_canonical = str(video_path_obj.resolve())
+        except Exception:
+            video_canonical = str(video_path_obj)
+        video_stem = self._safe_name_token(video_path_obj.stem or "video")
+        video_token = sha1(video_canonical.encode("utf-8")).hexdigest()[:10]
+        return f"{video_stem}__{video_token}"
+
+    @staticmethod
+    def find_export_image_for_stem(images_dir: Path, stem: str) -> Optional[Path]:
+        for suffix in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
+            img = images_dir / f"{stem}{suffix}"
+            if img.exists():
+                return img
+        return None
+
+    def flatten_manual_labels_root(self, labels_root: Path, force: bool = False) -> Tuple[int, int]:
+        """
+        Migrate older per-video manual-label folders into one shared pool:
+          labels_root/images/train + labels_root/labels/train
+        """
+        try:
+            labels_root = labels_root.resolve()
+        except Exception:
+            labels_root = labels_root
+        if not force and labels_root in self._flattened_manual_labels_roots:
+            return 0, 0
+
+        target_images = labels_root / "images" / "train"
+        target_labels = labels_root / "labels" / "train"
+        target_log = labels_root / "edits_log.csv"
+        target_images.mkdir(parents=True, exist_ok=True)
+        target_labels.mkdir(parents=True, exist_ok=True)
+
+        if not target_log.exists():
+            with open(target_log, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     "timestamp",
@@ -685,9 +777,145 @@ class VideoOverlayPlayer(QMainWindow):
                     "image_path",
                     "label_path",
                 ])
+
+        image_suffixes = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
+        moved_pairs = 0
+        moved_logs = 0
+
+        try:
+            target_labels_resolved = target_labels.resolve()
+        except Exception:
+            target_labels_resolved = target_labels
+        try:
+            labels_root_resolved = labels_root.resolve()
+        except Exception:
+            labels_root_resolved = labels_root
+
+        source_sets = []
+        for labels_dir in sorted(labels_root.rglob("labels/train")):
+            try:
+                labels_dir_resolved = labels_dir.resolve()
+            except Exception:
+                labels_dir_resolved = labels_dir
+            if labels_dir_resolved == target_labels_resolved:
+                continue
+            source_root = labels_dir.parent.parent
+            try:
+                source_root_resolved = source_root.resolve()
+            except Exception:
+                source_root_resolved = source_root
+            if source_root_resolved == labels_root_resolved:
+                continue
+            images_dir = source_root / "images" / "train"
+            if not images_dir.exists():
+                continue
+            source_sets.append((source_root, images_dir, labels_dir))
+
+        for source_root, source_images, source_labels in source_sets:
+            source_tag = self._safe_name_token(source_root.name or "source")
+
+            for label_file in sorted(source_labels.glob("*.txt")):
+                image_file = self.find_export_image_for_stem(source_images, label_file.stem)
+                if image_file is None:
+                    continue
+
+                base_stem = label_file.stem
+                candidate_stem = base_stem
+                dup_idx = 1
+                while True:
+                    label_conflict = (target_labels / f"{candidate_stem}.txt").exists()
+                    image_conflict = any(
+                        (target_images / f"{candidate_stem}{suffix}").exists()
+                        for suffix in image_suffixes
+                    )
+                    if not label_conflict and not image_conflict:
+                        break
+                    candidate_stem = f"{base_stem}__{source_tag}_{dup_idx:03d}"
+                    dup_idx += 1
+
+                target_label_file = target_labels / f"{candidate_stem}.txt"
+                target_image_file = target_images / f"{candidate_stem}{image_file.suffix.lower()}"
+                shutil.move(str(label_file), str(target_label_file))
+                shutil.move(str(image_file), str(target_image_file))
+                moved_pairs += 1
+
+            source_log = source_root / "edits_log.csv"
+            if source_log.exists():
+                with open(target_log, "a", newline="", encoding="utf-8") as dst_f:
+                    writer = csv.writer(dst_f)
+                    with open(source_log, "r", newline="", encoding="utf-8") as src_f:
+                        reader = csv.reader(src_f)
+                        _ = next(reader, None)
+                        for row in reader:
+                            if row:
+                                writer.writerow(row)
+                source_log.unlink(missing_ok=True)
+                moved_logs += 1
+
+            cleanup_dirs = [
+                source_labels,
+                source_labels.parent,
+                source_images,
+                source_images.parent,
+                source_root,
+            ]
+            for cleanup_dir in cleanup_dirs:
+                try:
+                    if cleanup_dir.exists() and cleanup_dir.is_dir():
+                        cleanup_dir.rmdir()
+                except OSError:
+                    pass
+
+        self._flattened_manual_labels_roots.add(labels_root)
+        return moved_pairs, moved_logs
+
+    def init_manual_export_paths(self, create_dirs: bool = True):
+        """Set output paths for edited frames/labels under shared root; optionally create folders."""
+        if not self.video_path:
+            return
+        labels_root = self.get_configured_manual_labels_root(create_dirs=create_dirs)
+        if labels_root is None:
+            self.export_root = None
+            self.export_frames_dir = None
+            self.export_labels_dir = None
+            self.export_log_path = None
+            return
+
+        self.export_root = labels_root
+        self.export_frames_dir = labels_root / "images" / "train"
+        self.export_labels_dir = labels_root / "labels" / "train"
+        self.export_log_path = labels_root / "edits_log.csv"
+
+        if create_dirs:
+            self.export_frames_dir.mkdir(parents=True, exist_ok=True)
+            self.export_labels_dir.mkdir(parents=True, exist_ok=True)
+            self.export_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if not self.export_log_path.exists():
+                with open(self.export_log_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "timestamp",
+                        "video_path",
+                        "dlc_path",
+                        "frame",
+                        "dlc_row",
+                        "edited_point",
+                        "image_path",
+                        "label_path",
+                    ])
+            moved_pairs, moved_logs = self.flatten_manual_labels_root(labels_root)
+            if moved_pairs > 0 or moved_logs > 0:
+                self.set_edit_status(
+                    f"Merged old per-video exports into shared pool ({moved_pairs} samples, {moved_logs} logs)."
+                )
         self.export_path_label.setText(f"Export folder: {self.export_root}")
         dlc_text = self.dlc_path if self.dlc_path else "(load files)"
         self.dlc_save_path_label.setText(f"DLC file overwritten on save: {dlc_text}")
+
+    def get_manual_labels_pool_root(self) -> Optional[Path]:
+        """Return shared manual labels root across all edited videos."""
+        return self.get_configured_manual_labels_root(create_dirs=False)
     
     def label_to_frame_coords(self, label_x: int, label_y: int) -> Optional[Tuple[int, int]]:
         """Map click coordinates from QLabel space into original frame pixel space."""
@@ -784,6 +1012,52 @@ class VideoOverlayPlayer(QMainWindow):
         if col_idx is None:
             return np.nan
         return self.dlc_data.iat[int(row_idx), col_idx]
+
+    def get_point_confidence_columns(self, point_name: str) -> List[str]:
+        """Return confidence column names for a point (supports *_cam fallback)."""
+        if self.dlc_data is None:
+            return []
+        candidates = [point_name]
+        if point_name.endswith("_cam"):
+            candidates.append(point_name[:-4])
+        cols = []
+        seen = set()
+        for candidate in candidates:
+            for suffix in ("_prob", "_likelihood", "_conf"):
+                conf_col = f"{candidate}{suffix}"
+                if conf_col in self.dlc_data.columns and conf_col not in seen:
+                    cols.append(conf_col)
+                    seen.add(conf_col)
+        return cols
+
+    def set_points_confidence_for_rows(
+        self, row_indices: List[int], point_names, confidence_value: float
+    ) -> int:
+        """Set confidence columns for given point names across one or more rows."""
+        if self.dlc_data is None:
+            return 0
+        rows = [int(r) for r in row_indices]
+        if not rows:
+            return 0
+
+        col_indices = []
+        seen_cols = set()
+        for point_name in point_names:
+            for conf_col in self.get_point_confidence_columns(point_name):
+                conf_idx = self._column_index(conf_col)
+                if conf_idx is None or conf_idx in seen_cols:
+                    continue
+                col_indices.append(conf_idx)
+                seen_cols.add(conf_idx)
+        if not col_indices:
+            return 0
+
+        conf_val = float(confidence_value)
+        if len(rows) == 1:
+            self.dlc_data.iloc[rows[0], col_indices] = conf_val
+        else:
+            self.dlc_data.iloc[rows, col_indices] = np.full((len(rows), len(col_indices)), conf_val)
+        return len(col_indices)
     
     def find_nearest_point_for_edit(self, dlc_row_idx: int, frame_x: int, frame_y: int) -> Optional[str]:
         """Find nearest visible point to cursor for drag selection."""
@@ -861,6 +1135,9 @@ class VideoOverlayPlayer(QMainWindow):
         
         self.set_cell_value(dlc_row_idx, x_col, x_raw)
         self.set_cell_value(dlc_row_idx, y_col, y_raw)
+        self.set_points_confidence_for_rows(
+            [int(dlc_row_idx)], [point_name], self.manual_edit_confidence
+        )
         self.drag_preview_raw = None
         
         # Reset cached row so display uses latest values immediately.
@@ -870,7 +1147,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.pending_export_frames.setdefault(int(self.current_frame), set()).add(point_name)
         self.save_timer.start(3000)
         self.set_edit_status(
-            f"Updated frame {self.current_frame}, point '{point_name}' (autosave queued; click Save Edits Now to export frame+label files)."
+            f"Updated frame {self.current_frame}, point '{point_name}' (conf={self.manual_edit_confidence:.2f}; autosave queued; click Save Edits Now to export frame+label files)."
         )
     
     def on_video_mouse_press(self, event):
@@ -978,10 +1255,7 @@ class VideoOverlayPlayer(QMainWindow):
                 cleared += 1
             
             # Best effort confidence cleanup for no-head frames.
-            for suffix in ["_prob", "_likelihood", "_conf"]:
-                conf_col = f"{point_name}{suffix}"
-                if conf_col in self.dlc_data.columns:
-                    self.set_cell_value(dlc_row_idx, conf_col, 0.0)
+            self.set_points_confidence_for_rows([int(dlc_row_idx)], [point_name], 0.0)
         
         self._last_dlc_row_idx = None
         self.drag_preview_raw = None
@@ -1021,10 +1295,7 @@ class VideoOverlayPlayer(QMainWindow):
         if y_col in self.dlc_data.columns:
             self.set_cell_value(dlc_row_idx, y_col, np.nan)
             changed = True
-        for suffix in ("_prob", "_likelihood", "_conf"):
-            conf_col = f"{point_name}{suffix}"
-            if conf_col in self.dlc_data.columns:
-                self.set_cell_value(dlc_row_idx, conf_col, 0.0)
+        self.set_points_confidence_for_rows([int(dlc_row_idx)], [point_name], 0.0)
 
         if not changed:
             self.set_edit_status(f"Missing x/y columns for point '{point_name}'.", is_error=True)
@@ -1087,8 +1358,7 @@ class VideoOverlayPlayer(QMainWindow):
             if has_xy:
                 copied_points += 1
 
-            for suffix in ("_prob", "_likelihood", "_conf"):
-                conf_col = f"{point_name}{suffix}"
+            for conf_col in self.get_point_confidence_columns(point_name):
                 conf_idx = self._column_index(conf_col)
                 if conf_idx is None or conf_idx in seen_cols:
                     continue
@@ -1131,6 +1401,9 @@ class VideoOverlayPlayer(QMainWindow):
             return
 
         copied = self.copy_editable_points_between_rows(prev_row_idx, curr_row_idx)
+        self.set_points_confidence_for_rows(
+            [int(curr_row_idx)], self.editable_point_names, self.manual_edit_confidence
+        )
 
         self._last_dlc_row_idx = None
         self.drag_preview_raw = None
@@ -1139,7 +1412,8 @@ class VideoOverlayPlayer(QMainWindow):
         self.save_timer.start(3000)
         self.render_drag_preview()
         self.set_edit_status(
-            f"Copied previous frame points into frame {self.current_frame} (copied {copied}; click Save Edits Now to export)."
+            f"Copied previous frame points into frame {self.current_frame} "
+            f"(copied {copied}; conf={self.manual_edit_confidence:.2f}; click Save Edits Now to export)."
         )
 
     def apply_current_frame_to_next_10(self):
@@ -1198,6 +1472,9 @@ class VideoOverlayPlayer(QMainWindow):
         source_values = self.dlc_data.iloc[int(source_row_idx), col_indices].to_numpy(copy=True)
         values_matrix = np.tile(source_values, (len(unique_target_rows), 1))
         self.dlc_data.iloc[unique_target_rows, col_indices] = values_matrix
+        self.set_points_confidence_for_rows(
+            unique_target_rows, self.editable_point_names, self.manual_edit_confidence
+        )
 
         applied_frames = len(unique_target_rows)
         copied_total = copied_points_per_frame * applied_frames
@@ -1211,7 +1488,8 @@ class VideoOverlayPlayer(QMainWindow):
         skipped_text = f"; skipped {skipped_frames} unmapped frame(s)" if skipped_frames else ""
         self.set_edit_status(
             f"Copied current frame into {applied_frames}/{attempted_frames} next frame(s) "
-            f"({start_target_frame}-{end_target_frame}; copied {copied_total} point sets{skipped_text}; "
+            f"({start_target_frame}-{end_target_frame}; copied {copied_total} point sets; "
+            f"conf={self.manual_edit_confidence:.2f}{skipped_text}; "
             "click Save Edits Now to export)."
         )
     
@@ -1321,7 +1599,8 @@ class VideoOverlayPlayer(QMainWindow):
         if frame_w <= 0 or frame_h <= 0:
             return
         
-        base_name = f"{Path(self.video_path).stem}_f{frame_num:07d}"
+        video_prefix = self.get_current_video_export_prefix()
+        base_name = f"{video_prefix}_f{frame_num:07d}"
         img_path = self.export_frames_dir / f"{base_name}.png"
         label_path = self.export_labels_dir / f"{base_name}.txt"
         
@@ -1534,24 +1813,28 @@ class VideoOverlayPlayer(QMainWindow):
         
         # Force a full save so both parquet/csv and manual_labels exports are up to date.
         self.persist_dlc_edits(export_frames=True, autosave=False)
-        self.init_manual_export_paths()
-        if self.export_labels_dir is None:
-            self.set_retrain_status("Export labels folder is not initialized.", is_error=True)
+        labels_pool_root = self.get_manual_labels_pool_root()
+        if labels_pool_root is None:
+            self.set_retrain_status("Manual labels folder is not initialized.", is_error=True)
             return
-        
-        label_files = sorted(self.export_labels_dir.glob("*.txt"))
+
+        self.flatten_manual_labels_root(labels_pool_root)
+        label_files = sorted((labels_pool_root / "labels" / "train").glob("*.txt"))
         if len(label_files) == 0:
             self.set_retrain_status(
                 "No exported label txt files found. Edit points and click Save Edits Now first.",
                 is_error=True
             )
             return
+        self.set_retrain_status(
+            f"Found {len(label_files)} manual label files under {labels_pool_root}. Starting retrain..."
+        )
         
         cmd = [
             sys.executable,
             str(self.retrain_helper_script),
             "--dlc-config", str(config_path),
-            "--labels-root", str(self.export_root),
+            "--labels-root", str(labels_pool_root),
             "--video-path", str(self.video_path),
             "--iterations", str(int(self.retrain_iters_spin.value())),
             "--cam-name", cam_name,
@@ -1563,7 +1846,7 @@ class VideoOverlayPlayer(QMainWindow):
         if model_path is not None:
             cmd.extend(["--model-path", str(model_path)])
         
-        log_dir = self.export_root / "retrain_logs"
+        log_dir = labels_pool_root / "retrain_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.retrain_log_path = log_dir / f"retrain_{timestamp}.log"
@@ -1674,6 +1957,10 @@ class VideoOverlayPlayer(QMainWindow):
         self.drag_preview_raw = None
         self.editable_point_names = set()
         self.pending_export_frames = {}
+        self.export_root = None
+        self.export_frames_dir = None
+        self.export_labels_dir = None
+        self.export_log_path = None
         self.refresh_clear_point_combo([])
         self._last_rendered_rgb_base = None
         self._pending_save = False
@@ -1798,11 +2085,11 @@ class VideoOverlayPlayer(QMainWindow):
         self.parse_dlc_points()
         print(f"Point configs created: {len(self.point_configs)}")
         
-        # Prepare manual label export directories for edit workflow
-        self.init_manual_export_paths()
+        # Prepare export paths for edit workflow (folders are created lazily on first export).
+        self.init_manual_export_paths(create_dirs=False)
         if self.export_root is not None:
             self.set_edit_status(
-                f"Edit export folder: {self.export_root}"
+                f"Edit export folder (created on first export): {self.export_root}"
             )
         
         # Setup progress slider
@@ -2380,6 +2667,7 @@ class VideoOverlayPlayer(QMainWindow):
                     
                     retrain_config = prefs.get('retrain_config_path', '')
                     retrain_run_model = prefs.get('retrain_run_model_script', '')
+                    manual_labels_root = prefs.get('manual_labels_root', '')
                     retrain_model_path = prefs.get('retrain_model_path', '')
                     retrain_model_name = prefs.get('retrain_model_name', '')
                     retrain_cam_name = prefs.get('retrain_cam_name', 'top')
@@ -2394,6 +2682,8 @@ class VideoOverlayPlayer(QMainWindow):
                         default_run_model = Path.home() / "Dev" / "PreyTouch" / "Arena" / "run_model.py"
                         if default_run_model.exists():
                             self.run_model_script_input.setText(str(default_run_model))
+                    if manual_labels_root:
+                        self.manual_labels_root_input.setText(manual_labels_root)
                     if retrain_model_path:
                         self.retrain_model_path_input.setText(retrain_model_path)
                     if retrain_model_name:
@@ -2411,6 +2701,8 @@ class VideoOverlayPlayer(QMainWindow):
                 self.run_model_script_input.setText(str(default_run_model))
         if not self.retrain_model_path_input.text().strip():
             self.retrain_model_path_input.setText(str(self.default_model_root))
+        if not self.manual_labels_root_input.text().strip():
+            self.manual_labels_root_input.setText(str(self.default_manual_labels_root))
                 
     def save_preferences(self):
         """Save current preferences"""
@@ -2436,6 +2728,7 @@ class VideoOverlayPlayer(QMainWindow):
                 'last_dlc_dir': self.last_dlc_dir,
                 'retrain_config_path': self.retrain_config_input.text().strip(),
                 'retrain_run_model_script': self.run_model_script_input.text().strip(),
+                'manual_labels_root': self.manual_labels_root_input.text().strip(),
                 'retrain_model_path': self.retrain_model_path_input.text().strip(),
                 'retrain_model_name': self.retrain_model_name_input.text().strip(),
                 'retrain_cam_name': self.retrain_cam_name_input.text().strip(),

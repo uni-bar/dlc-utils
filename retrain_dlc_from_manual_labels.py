@@ -109,6 +109,141 @@ def find_matching_image(images_dir: Path, stem: str) -> Optional[Path]:
     return None
 
 
+def _safe_tag(text: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in text)
+
+
+def flatten_manual_labels_root(labels_root: Path) -> Dict[str, int]:
+    """Merge legacy per-video export folders into one shared labels_root/images+labels pool."""
+    target_images = labels_root / "images" / "train"
+    target_labels = labels_root / "labels" / "train"
+    target_images.mkdir(parents=True, exist_ok=True)
+    target_labels.mkdir(parents=True, exist_ok=True)
+
+    image_suffixes = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
+    moved_pairs = 0
+    skipped_no_image = 0
+
+    try:
+        target_labels_resolved = target_labels.resolve()
+    except Exception:
+        target_labels_resolved = target_labels
+    try:
+        labels_root_resolved = labels_root.resolve()
+    except Exception:
+        labels_root_resolved = labels_root
+
+    source_sets = []
+    for labels_dir in sorted(labels_root.rglob("labels/train")):
+        try:
+            labels_dir_resolved = labels_dir.resolve()
+        except Exception:
+            labels_dir_resolved = labels_dir
+        if labels_dir_resolved == target_labels_resolved:
+            continue
+
+        source_root = labels_dir.parent.parent
+        try:
+            source_root_resolved = source_root.resolve()
+        except Exception:
+            source_root_resolved = source_root
+        if source_root_resolved == labels_root_resolved:
+            continue
+
+        images_dir = source_root / "images" / "train"
+        if images_dir.exists():
+            source_sets.append((source_root, images_dir, labels_dir))
+
+    for source_root, source_images, source_labels in source_sets:
+        source_tag = _safe_tag(source_root.name or "source")
+
+        for label_file in sorted(source_labels.glob("*.txt")):
+            image_file = find_matching_image(source_images, label_file.stem)
+            if image_file is None:
+                skipped_no_image += 1
+                continue
+
+            base_stem = label_file.stem
+            candidate_stem = base_stem
+            idx = 1
+            while True:
+                label_conflict = (target_labels / f"{candidate_stem}.txt").exists()
+                image_conflict = any(
+                    (target_images / f"{candidate_stem}{suffix}").exists()
+                    for suffix in image_suffixes
+                )
+                if not label_conflict and not image_conflict:
+                    break
+                candidate_stem = f"{base_stem}__{source_tag}_{idx:03d}"
+                idx += 1
+
+            shutil.move(str(label_file), str(target_labels / f"{candidate_stem}.txt"))
+            shutil.move(
+                str(image_file), str(target_images / f"{candidate_stem}{image_file.suffix.lower()}")
+            )
+            moved_pairs += 1
+
+        cleanup_dirs = [
+            source_labels,
+            source_labels.parent,
+            source_images,
+            source_images.parent,
+            source_root,
+        ]
+        for cleanup_dir in cleanup_dirs:
+            try:
+                if cleanup_dir.exists() and cleanup_dir.is_dir():
+                    cleanup_dir.rmdir()
+            except OSError:
+                pass
+
+    return {
+        "moved_pairs": moved_pairs,
+        "skipped_no_image": skipped_no_image,
+        "source_sets": len(source_sets),
+    }
+
+
+def discover_label_sources(labels_root: Path) -> List[Tuple[Path, Path, str]]:
+    """
+    Discover one or more manual-label sources under labels_root.
+    Preferred layout:
+    1) labels_root/images/train + labels_root/labels/train
+    Legacy fallback:
+    2) labels_root/<video_stem>/images/train + labels_root/<video_stem>/labels/train
+    """
+    sources: List[Tuple[Path, Path, str]] = []
+    seen = set()
+
+    direct_images = labels_root / "images" / "train"
+    direct_labels = labels_root / "labels" / "train"
+    if direct_images.exists() and direct_labels.exists():
+        tag = _safe_tag(labels_root.name or "manual_labels")
+        key = (str(direct_images.resolve()), str(direct_labels.resolve()))
+        if key not in seen:
+            sources.append((direct_images, direct_labels, tag))
+            seen.add(key)
+
+    for labels_dir in sorted(labels_root.rglob("labels/train")):
+        source_root = labels_dir.parent.parent
+        images_dir = source_root / "images" / "train"
+        if not images_dir.exists():
+            continue
+        try:
+            rel_root = source_root.relative_to(labels_root)
+            tag_text = "__".join(rel_root.parts) if rel_root.parts else source_root.name
+        except Exception:
+            tag_text = source_root.name
+        tag = _safe_tag(tag_text or "manual_labels")
+        key = (str(images_dir.resolve()), str(labels_dir.resolve()))
+        if key in seen:
+            continue
+        sources.append((images_dir, labels_dir, tag))
+        seen.add(key)
+
+    return sources
+
+
 def build_dlc_labeled_dataset(
     labels_root: Path,
     project_path: Path,
@@ -116,11 +251,11 @@ def build_dlc_labeled_dataset(
     bodyparts: List[str],
     dataset_name: str,
 ):
-    images_dir = labels_root / "images" / "train"
-    labels_dir = labels_root / "labels" / "train"
-    if not images_dir.exists() or not labels_dir.exists():
+    sources = discover_label_sources(labels_root)
+    if len(sources) == 0:
         raise RuntimeError(
-            f"Expected folders missing under {labels_root}. Need images/train and labels/train."
+            f"No manual label sources found under {labels_root}. "
+            "Expected labels/train + images/train (directly or per-video subfolders)."
         )
 
     out_dir = project_path / "labeled-data" / dataset_name
@@ -130,32 +265,40 @@ def build_dlc_labeled_dataset(
     samples = []
     skipped_missing_image = 0
     skipped_empty = 0
+    skipped_duplicate = 0
+    used_rel_images = set()
 
-    label_files = sorted(labels_dir.glob("*.txt"))
-    for label_file in label_files:
-        stem = label_file.stem
-        image_file = find_matching_image(images_dir, stem)
-        if image_file is None:
-            skipped_missing_image += 1
-            continue
+    for images_dir, labels_dir, source_tag in sources:
+        label_files = sorted(labels_dir.glob("*.txt"))
+        for label_file in label_files:
+            stem = label_file.stem
+            image_file = find_matching_image(images_dir, stem)
+            if image_file is None:
+                skipped_missing_image += 1
+                continue
 
-        parsed = parse_manual_label_file(label_file)
-        mapped_points: Dict[str, Tuple[float, float]] = {}
-        for point_name, xy in parsed.items():
-            mapped_name = map_point_name(point_name, bodyparts_set)
-            if mapped_name is not None:
-                mapped_points[mapped_name] = xy
+            parsed = parse_manual_label_file(label_file)
+            mapped_points: Dict[str, Tuple[float, float]] = {}
+            for point_name, xy in parsed.items():
+                mapped_name = map_point_name(point_name, bodyparts_set)
+                if mapped_name is not None:
+                    mapped_points[mapped_name] = xy
 
-        if len(mapped_points) == 0:
-            skipped_empty += 1
-            continue
+            if len(mapped_points) == 0:
+                skipped_empty += 1
+                continue
 
-        dst_image = out_dir / image_file.name
-        if not dst_image.exists():
-            shutil.copy2(image_file, dst_image)
+            dst_name = f"{source_tag}__{image_file.stem}{image_file.suffix.lower()}"
+            rel_image = (Path("labeled-data") / dataset_name / dst_name).as_posix()
+            if rel_image in used_rel_images:
+                skipped_duplicate += 1
+                continue
+            used_rel_images.add(rel_image)
 
-        rel_image = (Path("labeled-data") / dataset_name / image_file.name).as_posix()
-        samples.append((rel_image, mapped_points))
+            dst_image = out_dir / dst_name
+            if not dst_image.exists():
+                shutil.copy2(image_file, dst_image)
+            samples.append((rel_image, mapped_points))
 
     if len(samples) == 0:
         raise RuntimeError(
@@ -189,8 +332,10 @@ def build_dlc_labeled_dataset(
         "csv_path": csv_path,
         "h5_path": h5_path,
         "sample_count": len(samples),
+        "source_count": len(sources),
         "skipped_missing_image": skipped_missing_image,
         "skipped_empty": skipped_empty,
+        "skipped_duplicate": skipped_duplicate,
     }
 
 
@@ -346,7 +491,11 @@ def main():
         description="Retrain DeepLabCut from manual_labels and optionally re-run PreyTouch prediction."
     )
     parser.add_argument("--dlc-config", required=True, help="Path to DLC project config.yaml")
-    parser.add_argument("--labels-root", required=True, help="Path to manual_labels/<video_stem> folder")
+    parser.add_argument(
+        "--labels-root",
+        required=True,
+        help="Path to shared manual_labels root (images/train + labels/train).",
+    )
     parser.add_argument("--video-path", default=None, help="Video path used for labels and optional rerun")
     parser.add_argument("--dataset-name", default=None, help="Dataset folder name under DLC labeled-data")
     parser.add_argument("--shuffle", type=int, default=1, help="DLC shuffle number")
@@ -372,8 +521,16 @@ def main():
     if model_path_override is not None and not model_path_override.exists():
         raise RuntimeError(f"model-path not found: {model_path_override}")
 
+    flatten_stats = flatten_manual_labels_root(labels_root)
     log(f"DLC config: {dlc_config_path}")
     log(f"Labels root: {labels_root}")
+    if flatten_stats["source_sets"] > 0:
+        log(
+            "Flattened manual labels root: "
+            f"sources={flatten_stats['source_sets']}, "
+            f"moved_pairs={flatten_stats['moved_pairs']}, "
+            f"skipped_no_image={flatten_stats['skipped_no_image']}"
+        )
     if video_path:
         log(f"Video path: {video_path}")
 
@@ -393,9 +550,11 @@ def main():
     )
     log(
         "Prepared labeled-data dataset: "
+        f"sources={prep_stats['source_count']}, "
         f"samples={prep_stats['sample_count']}, "
         f"skipped_missing_image={prep_stats['skipped_missing_image']}, "
-        f"skipped_empty={prep_stats['skipped_empty']}"
+        f"skipped_empty={prep_stats['skipped_empty']}, "
+        f"skipped_duplicate={prep_stats['skipped_duplicate']}"
     )
     log(f"Collected CSV: {prep_stats['csv_path']}")
     log(f"Collected H5: {prep_stats['h5_path']}")
