@@ -1,5 +1,13 @@
-__pycache__/dlc_video_overlay.cpython-310.pyc
-__pycache__/retrain_dlc_from_manual_labels.cpython-310.pyc
+
 __pycache__/*
 
 dist/*
+
+.eggs/*
+manual_labels/*
+build/*
+.spec
+__pycache__/dlc_video_overlay.cpython-38.pyc
+__pycache__/dlc_video_overlay.cpython-310.pyc
+__pycache__/retrain_dlc_from_manual_labels.cpython-310.pyc
+manual_labels/edits_log.csv

@@ -7,13 +7,15 @@ A lightweight video player with DeepLabCut point overlay capabilities
 import sys
 import csv
 import json
+import math
 import random
 import shutil
 import subprocess
+import traceback
 from hashlib import sha1
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 import cv2
 import pandas as pd
@@ -22,10 +24,21 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QCheckBox,
     QScrollArea, QGroupBox, QSpinBox, QColorDialog, QSlider, QSizePolicy,
-    QComboBox
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QMessageBox
 )
-from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QUrl
+from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, QUrl
 from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QPen, QDesktopServices
+
+try:
+    from run_edited_pose_calibration import (
+        DEFAULT_APP_CALIBRATION_DIR,
+        run_edited_pose_calibration_job,
+    )
+    CALIBRATION_HELPER_IMPORT_ERROR = None
+except Exception as exc:
+    DEFAULT_APP_CALIBRATION_DIR = None
+    run_edited_pose_calibration_job = None
+    CALIBRATION_HELPER_IMPORT_ERROR = str(exc)
 
 
 class InteractiveVideoLabel(QLabel):
@@ -77,6 +90,380 @@ class InteractiveVideoLabel(QLabel):
         super().mouseReleaseEvent(event)
 
 
+class CopyFrameRangeDialog(QDialog):
+    """Prompt for a source frame and a till frame for bulk point copying."""
+
+    def __init__(self, min_frame: int, max_frame: int, source_frame: int, till_frame: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Copy Points Across Frames")
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "Copy editable point values from the source frame to every frame until the till frame. "
+            "The source frame itself is not overwritten."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        form_layout = QFormLayout()
+
+        self.source_frame_spin = QSpinBox()
+        self.source_frame_spin.setRange(min_frame, max_frame)
+        self.source_frame_spin.setValue(max(min_frame, min(max_frame, source_frame)))
+        form_layout.addRow("Source frame:", self.source_frame_spin)
+
+        self.till_frame_spin = QSpinBox()
+        self.till_frame_spin.setRange(min_frame, max_frame)
+        self.till_frame_spin.setValue(max(min_frame, min(max_frame, till_frame)))
+        form_layout.addRow("Till frame:", self.till_frame_spin)
+
+        layout.addLayout(form_layout)
+
+        hint_label = QLabel("Forward and backward ranges are both supported.")
+        hint_label.setStyleSheet("font-size: 8.5pt; color: #555555;")
+        layout.addWidget(hint_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_selected_frames(self) -> Tuple[int, int]:
+        """Return source and till frames selected in the dialog."""
+        return int(self.source_frame_spin.value()), int(self.till_frame_spin.value())
+
+
+class FrameRangeDialog(QDialog):
+    """Prompt for an inclusive frame range."""
+
+    def __init__(
+        self,
+        title: str,
+        description: str,
+        start_label: str,
+        end_label: str,
+        min_frame: int,
+        max_frame: int,
+        start_frame: int,
+        end_frame: int,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(description)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        form_layout = QFormLayout()
+
+        self.start_frame_spin = QSpinBox()
+        self.start_frame_spin.setRange(min_frame, max_frame)
+        self.start_frame_spin.setValue(max(min_frame, min(max_frame, start_frame)))
+        form_layout.addRow(start_label, self.start_frame_spin)
+
+        self.end_frame_spin = QSpinBox()
+        self.end_frame_spin.setRange(min_frame, max_frame)
+        self.end_frame_spin.setValue(max(min_frame, min(max_frame, end_frame)))
+        form_layout.addRow(end_label, self.end_frame_spin)
+
+        layout.addLayout(form_layout)
+
+        hint_label = QLabel("The range is inclusive. Forward and backward ranges are both supported.")
+        hint_label.setStyleSheet("font-size: 8.5pt; color: #555555;")
+        layout.addWidget(hint_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_selected_frames(self) -> Tuple[int, int]:
+        """Return inclusive start/end frames selected in the dialog."""
+        return int(self.start_frame_spin.value()), int(self.end_frame_spin.value())
+
+
+def point_raw_to_pixels_for_export(
+    x_raw: float, y_raw: float, frame_w: int, frame_h: int, coords_are_normalized: bool
+) -> Tuple[int, int]:
+    """Convert stored DLC coordinates into frame pixels for export labels."""
+    if coords_are_normalized:
+        x_px = int(float(x_raw) * frame_w)
+        y_px = int(float(y_raw) * frame_h)
+    else:
+        x_px = int(float(x_raw))
+        y_px = int(float(y_raw))
+    x_px = max(0, min(frame_w - 1, x_px))
+    y_px = max(0, min(frame_h - 1, y_px))
+    return x_px, y_px
+
+
+def get_snapshot_dlc_row_for_frame(
+    video_frame: int,
+    dlc_frame_map: Optional[Dict[int, int]],
+    start_frame: int,
+    row_count: int,
+) -> Optional[int]:
+    """Resolve a video frame to a DLC row using a snapshot of the frame map."""
+    if dlc_frame_map is not None and video_frame in dlc_frame_map:
+        return int(dlc_frame_map[video_frame])
+
+    row_from_start = video_frame - start_frame
+    if 0 <= row_from_start < row_count:
+        return int(row_from_start)
+    if 0 <= video_frame < row_count:
+        return int(video_frame)
+    return None
+
+
+def ensure_export_log_header(export_log_path: Path):
+    """Create the export log with header if it does not already exist."""
+    if export_log_path.exists():
+        return
+    export_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(export_log_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "timestamp",
+            "video_path",
+            "dlc_path",
+            "frame",
+            "dlc_row",
+            "edited_point",
+            "image_path",
+            "label_path",
+        ])
+
+
+class SaveExportWorker(QObject):
+    """Write DLC data and optional frame/label exports off the UI thread."""
+
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, job: Dict[str, Any]):
+        super().__init__()
+        self.job = job
+
+    def run(self):
+        try:
+            self.finished.emit(self._run_job())
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+    def _read_frame_bgr(self, cap, frame_num: int) -> Optional[np.ndarray]:
+        if cap is None or not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_num))
+        ret, frame = cap.read()
+        if not ret:
+            return None
+        return frame
+
+    def _get_point_confidence_value(self, row_data, point_name: str) -> Optional[float]:
+        candidates = [point_name]
+        if point_name.endswith("_cam"):
+            candidates.append(point_name[:-4])
+        for candidate in candidates:
+            for suffix in ("_prob", "_likelihood", "_conf"):
+                conf_col = f"{candidate}{suffix}"
+                if conf_col not in row_data.index:
+                    continue
+                conf_val = row_data.get(conf_col, np.nan)
+                if pd.notna(conf_val):
+                    try:
+                        return float(conf_val)
+                    except Exception:
+                        continue
+        return None
+
+    def _write_export_label(
+        self,
+        dlc_row_idx: int,
+        edited_point: str,
+        frame_num: int,
+        frame_bgr: np.ndarray,
+    ):
+        job = self.job
+        df = job["dlc_data"]
+        export_frames_dir = Path(job["export_frames_dir"])
+        export_labels_dir = Path(job["export_labels_dir"])
+        export_log_path = Path(job["export_log_path"])
+        frame_h, frame_w = frame_bgr.shape[:2]
+        if frame_w <= 0 or frame_h <= 0:
+            return
+
+        base_name = f"{job['video_export_prefix']}_f{int(frame_num):07d}"
+        img_path = export_frames_dir / f"{base_name}.png"
+        label_path = export_labels_dir / f"{base_name}.txt"
+
+        cv2.imwrite(str(img_path), frame_bgr)
+
+        row = df.iloc[int(dlc_row_idx)]
+        lines = [
+            f"# video_path={job['video_path']}",
+            f"# dlc_path={job['dlc_path']}",
+            f"# frame={frame_num}",
+            f"# dlc_row={dlc_row_idx}",
+            f"# edited_point={edited_point}",
+            f"# timestamp={datetime.utcnow().isoformat()}Z",
+            "point_name,x_raw,y_raw,x_pixel,y_pixel,x_norm,y_norm,confidence",
+        ]
+
+        for point_name in job["editable_point_names"]:
+            x_col = f"{point_name}_x"
+            y_col = f"{point_name}_y"
+            if x_col not in df.columns or y_col not in df.columns:
+                continue
+            x_val = row[x_col]
+            y_val = row[y_col]
+            if pd.isna(x_val) or pd.isna(y_val):
+                continue
+
+            x_raw = float(x_val)
+            y_raw = float(y_val)
+            x_px, y_px = point_raw_to_pixels_for_export(
+                x_raw, y_raw, frame_w, frame_h, bool(job["coords_are_normalized"])
+            )
+            x_norm = x_raw if job["coords_are_normalized"] else (x_raw / max(frame_w, 1))
+            y_norm = y_raw if job["coords_are_normalized"] else (y_raw / max(frame_h, 1))
+            conf_val = self._get_point_confidence_value(row, point_name)
+            conf_text = "" if conf_val is None else f"{conf_val:.6f}"
+            lines.append(
+                f"{point_name},{x_raw:.6f},{y_raw:.6f},{x_px},{y_px},{x_norm:.6f},{y_norm:.6f},{conf_text}"
+            )
+
+        with open(label_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        with open(export_log_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.utcnow().isoformat() + "Z",
+                job["video_path"],
+                job["dlc_path"],
+                frame_num,
+                dlc_row_idx,
+                edited_point,
+                str(img_path),
+                str(label_path),
+            ])
+
+    def _run_job(self) -> Dict[str, Any]:
+        job = self.job
+        dlc_file = Path(job["dlc_path"])
+        is_parquet = bool(job["is_parquet"])
+        tmp_file = (
+            dlc_file.with_name(dlc_file.name + ".tmp.parquet")
+            if is_parquet else
+            dlc_file.with_name(dlc_file.name + ".tmp.csv")
+        )
+        backup_file = dlc_file.with_suffix(dlc_file.suffix + ".bak")
+        created_backup = False
+
+        if job["create_backup"] and dlc_file.exists() and not backup_file.exists():
+            shutil.copy2(dlc_file, backup_file)
+            created_backup = True
+
+        if is_parquet:
+            job["dlc_data"].to_parquet(tmp_file, index=False)
+        else:
+            job["dlc_data"].to_csv(tmp_file, index=False)
+        tmp_file.replace(dlc_file)
+
+        processed_frames = []
+        exported_count = 0
+        pending = sorted(job["pending_export_frames"].items(), key=lambda item: item[0])
+        if job["export_frames"] and pending:
+            export_frames_dir = Path(job["export_frames_dir"]) if job["export_frames_dir"] else None
+            export_labels_dir = Path(job["export_labels_dir"]) if job["export_labels_dir"] else None
+            export_log_path = Path(job["export_log_path"]) if job["export_log_path"] else None
+            if export_frames_dir is not None and export_labels_dir is not None and export_log_path is not None:
+                export_frames_dir.mkdir(parents=True, exist_ok=True)
+                export_labels_dir.mkdir(parents=True, exist_ok=True)
+                ensure_export_log_header(export_log_path)
+
+                cap = None
+                if job["video_path"]:
+                    cap = cv2.VideoCapture(str(job["video_path"]))
+                try:
+                    for frame_num, edited_points in pending:
+                        frame_num = int(frame_num)
+                        dlc_row_idx = get_snapshot_dlc_row_for_frame(
+                            video_frame=frame_num,
+                            dlc_frame_map=job["dlc_frame_map"],
+                            start_frame=int(job["start_frame"]),
+                            row_count=len(job["dlc_data"]),
+                        )
+                        processed_frames.append(frame_num)
+                        if dlc_row_idx is None:
+                            continue
+
+                        if frame_num == int(job["current_frame"]) and job["current_frame_bgr"] is not None:
+                            frame_bgr = job["current_frame_bgr"].copy()
+                        else:
+                            frame_bgr = self._read_frame_bgr(cap, frame_num)
+                        if frame_bgr is None:
+                            continue
+
+                        edited_point_text = "|".join(sorted(edited_points)) if edited_points else "EDITED"
+                        self._write_export_label(
+                            dlc_row_idx=dlc_row_idx,
+                            edited_point=edited_point_text,
+                            frame_num=frame_num,
+                            frame_bgr=frame_bgr,
+                        )
+                        exported_count += 1
+                finally:
+                    if cap is not None:
+                        cap.release()
+
+        return {
+            "dlc_path": str(dlc_file),
+            "revision": int(job["revision"]),
+            "export_frames": bool(job["export_frames"]),
+            "autosave": bool(job["autosave"]),
+            "processed_frames": processed_frames,
+            "exported_count": exported_count,
+            "export_root": job["export_root"],
+            "created_backup": created_backup,
+        }
+
+
+class CalibrationWorker(QObject):
+    """Reapply calibrated pose columns off the UI thread."""
+
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, job: Dict[str, Any]):
+        super().__init__()
+        self.job = job
+
+    def run(self):
+        try:
+            if run_edited_pose_calibration_job is None:
+                raise RuntimeError(
+                    "Calibration helper could not be imported"
+                    + (f": {CALIBRATION_HELPER_IMPORT_ERROR}" if CALIBRATION_HELPER_IMPORT_ERROR else "")
+                )
+
+            log_lines: List[str] = []
+            result = run_edited_pose_calibration_job(
+                pose_file=self.job["pose_file"],
+                video_path=self.job["video_path"],
+                calibration_dir=self.job["calibration_dir"],
+                logger=lambda message: log_lines.append(str(message)),
+            )
+            result["log_lines"] = log_lines
+            self.finished.emit(result)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class VideoOverlayPlayer(QMainWindow):
     """Main application window for video overlay player"""
     
@@ -121,16 +508,38 @@ class VideoOverlayPlayer(QMainWindow):
         self.dragging_point_name = None
         self.dragging_dlc_row_idx = None
         self.drag_start_frame = None
+        self.drag_start_frame_pos = None  # (x_px, y_px) anchor at drag start
+        self.drag_all_points = False
+        self.drag_rotate_points = False
+        self.drag_source_points_raw = {}  # {point_name: (x_raw, y_raw)} captured at drag start
+        self.drag_rotation_center_point = None
+        self.drag_rotation_center_px = None
+        self.drag_rotation_start_angle = None
         self.drag_radius_px = 24
         self._last_rendered_frame_size = None  # (width, height)
         self._last_rendered_bgr = None
         self._display_rect = None  # (x_offset, y_offset, width, height)
         self.editable_point_names = set()
         self.drag_preview_raw = None  # (x_raw, y_raw) used only while dragging
+        self.drag_preview_points_raw = {}  # {point_name: (x_raw, y_raw)} for shift-drag preview
         self._last_rendered_rgb_base = None
         self.pending_export_frames = {}  # {frame_num: set([point_name, ...])}
+        self.pending_export_frame_revisions = {}
         self._pending_save = False
         self._dlc_backup_created = False
+        self._edit_revision = 0
+        self._save_in_progress = False
+        self._save_followup_requested = False
+        self._save_followup_export = False
+        self._save_thread = None
+        self._save_worker = None
+        self._load_after_save = False
+        self._load_after_save_paths = None
+        self._close_after_save = False
+        self._retrain_after_save = False
+        self._calibration_after_save = False
+        self._close_after_calibration = False
+        self._loaded_dlc_signature = None
         self.export_root = None
         self.export_frames_dir = None
         self.export_labels_dir = None
@@ -140,10 +549,17 @@ class VideoOverlayPlayer(QMainWindow):
         self.retrain_log_handle = None
         self.retrain_log_path = None
         self.retrain_helper_script = Path(__file__).with_name("retrain_dlc_from_manual_labels.py")
+        self._calibration_in_progress = False
+        self._calibration_thread = None
+        self._calibration_worker = None
+        self.default_calibration_dir = (
+            Path(DEFAULT_APP_CALIBRATION_DIR)
+            if DEFAULT_APP_CALIBRATION_DIR else None
+        )
         # Default shared manual-labels root in the source/app folder if user does not choose one.
         self.default_manual_labels_root = Path(__file__).resolve().parent / "manual_labels"
         self._flattened_manual_labels_roots = set()
-        self.manual_edit_confidence = 0.6
+        self.manual_edit_confidence = 1.0
         
         # Timer for playback
         self.timer = QTimer()
@@ -284,6 +700,20 @@ class VideoOverlayPlayer(QMainWindow):
         self.apply_next10_btn.clicked.connect(self.apply_current_frame_to_next_10)
         edit_layout.addWidget(self.apply_next10_btn)
 
+        self.apply_source_range_btn = QPushButton("Apply Source -> Till...")
+        self.apply_source_range_btn.clicked.connect(self.prompt_copy_source_frame_range)
+        edit_layout.addWidget(self.apply_source_range_btn)
+
+        self.flip_ears_btn = QPushButton("Flip L/R Ears")
+        self.flip_ears_btn.clicked.connect(self.flip_ear_points_current_frame)
+        self.flip_ears_btn.setEnabled(False)
+        edit_layout.addWidget(self.flip_ears_btn)
+
+        self.flip_ears_range_btn = QPushButton("Flip L/R Ears A -> B")
+        self.flip_ears_range_btn.clicked.connect(self.prompt_flip_ears_frame_range)
+        self.flip_ears_range_btn.setEnabled(False)
+        edit_layout.addWidget(self.flip_ears_range_btn)
+
         clear_point_row = QHBoxLayout()
         self.clear_point_combo = QComboBox()
         self.clear_point_combo.setPlaceholderText("Select point...")
@@ -303,7 +733,7 @@ class VideoOverlayPlayer(QMainWindow):
         manual_labels_row.addWidget(manual_labels_browse_btn)
         edit_layout.addLayout(manual_labels_row)
         
-        self.edit_status_label = QLabel("Tip: turn Edit ON, then drag points on the frame.")
+        self.edit_status_label = QLabel("Tip: turn Edit ON, drag a point, or hold Shift to drag all points together.")
         self.edit_status_label.setWordWrap(True)
         self.edit_status_label.setStyleSheet("font-size: 9pt; color: #444444;")
         edit_layout.addWidget(self.edit_status_label)
@@ -374,6 +804,19 @@ class VideoOverlayPlayer(QMainWindow):
         retrain_args_row.addWidget(QLabel("Iters:"))
         retrain_args_row.addWidget(self.retrain_iters_spin)
         retrain_layout.addLayout(retrain_args_row)
+
+        self.reapply_calibration_btn = QPushButton("Reapply Calibration To Edited DLC")
+        self.reapply_calibration_btn.clicked.connect(self.start_reapply_calibration)
+        if self.default_calibration_dir is not None:
+            self.reapply_calibration_btn.setToolTip(
+                f"Uses the current DLC file, current video, and calibration dir {self.default_calibration_dir}"
+            )
+        retrain_layout.addWidget(self.reapply_calibration_btn)
+
+        self.calibration_status_label = QLabel("Calibration status: idle")
+        self.calibration_status_label.setWordWrap(True)
+        self.calibration_status_label.setStyleSheet("font-size: 8.5pt; color: #555555;")
+        retrain_layout.addWidget(self.calibration_status_label)
         
         self.retrain_btn = QPushButton("Retrain + Re-run This Video")
         self.retrain_btn.clicked.connect(self.start_retrain_and_rerun)
@@ -386,6 +829,7 @@ class VideoOverlayPlayer(QMainWindow):
         
         retrain_group.setLayout(retrain_layout)
         edit_layout.addWidget(retrain_group)
+        self.refresh_background_action_buttons()
         
         edit_group.setLayout(edit_layout)
         left_layout.addWidget(edit_group)
@@ -411,9 +855,8 @@ class VideoOverlayPlayer(QMainWindow):
         
         left_layout.addStretch()
         left_scroll.setWidget(left_panel)
-        main_layout.addWidget(left_scroll)
         
-        # Right panel - Video display and controls
+        # Left panel - Video display and controls
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
@@ -468,8 +911,9 @@ class VideoOverlayPlayer(QMainWindow):
         controls_layout.addWidget(skip_forward_btn)
         
         right_layout.addLayout(controls_layout)
-        
+
         main_layout.addWidget(right_panel, stretch=1)
+        main_layout.addWidget(left_scroll)
         
     def browse_video(self):
         """Open file dialog to select video"""
@@ -690,14 +1134,11 @@ class VideoOverlayPlayer(QMainWindow):
                 "QPushButton { background-color: #2E7D32; color: white; font-weight: bold; }"
             )
             self.video_label.setCursor(Qt.CrossCursor)
-            self.set_edit_status("Edit mode ON. Drag _cam_ points. Release queues save and exports frame label.")
+            self.set_edit_status("Edit mode ON. Drag points, or hold Shift to move all points together. Release queues save and exports frame label.")
         else:
             self.edit_mode_btn.setText("Edit: OFF")
             self.edit_mode_btn.setStyleSheet("")
-            self.video_label.setCursor(Qt.ArrowCursor)
-            self.dragging_point_name = None
-            self.dragging_dlc_row_idx = None
-            self.drag_start_frame = None
+            self.clear_drag_state()
             self.persist_dlc_edits()
             self.set_edit_status("Edit mode OFF.")
     
@@ -916,6 +1357,281 @@ class VideoOverlayPlayer(QMainWindow):
     def get_manual_labels_pool_root(self) -> Optional[Path]:
         """Return shared manual labels root across all edited videos."""
         return self.get_configured_manual_labels_root(create_dirs=False)
+
+    def begin_edit_revision(self) -> int:
+        """Advance revision counter for a new in-memory edit operation."""
+        self._edit_revision += 1
+        return int(self._edit_revision)
+
+    def queue_pending_export(self, frame_num: int, tags: Any, revision: int):
+        """Mark a frame for later image/label export and remember its latest edit revision."""
+        frame_num = int(frame_num)
+        frame_exports = self.pending_export_frames.setdefault(frame_num, set())
+        if isinstance(tags, str):
+            frame_exports.add(tags)
+        else:
+            frame_exports.update(tags)
+        self.pending_export_frame_revisions[frame_num] = max(
+            int(revision),
+            int(self.pending_export_frame_revisions.get(frame_num, -1)),
+        )
+
+    def set_save_ui_busy(self, busy: bool, export_frames: bool = False, autosave: bool = False):
+        """Reflect background save state in the Save button without blocking editing."""
+        if not hasattr(self, "save_edits_btn"):
+            return
+        self.save_edits_btn.setEnabled(not busy)
+        if not busy:
+            self.save_edits_btn.setText("Save Edits Now")
+            return
+        if export_frames:
+            self.save_edits_btn.setText("Saving + Exporting...")
+        elif autosave:
+            self.save_edits_btn.setText("Autosaving...")
+        else:
+            self.save_edits_btn.setText("Saving...")
+
+    def build_save_job(self, export_frames: bool, autosave: bool) -> Dict[str, Any]:
+        """Snapshot the current state for background DLC save/export work."""
+        if export_frames:
+            self.init_manual_export_paths(create_dirs=False)
+
+        dlc_file = Path(self.dlc_path)
+        backup_file = dlc_file.with_suffix(dlc_file.suffix + ".bak")
+        return {
+            "revision": int(self._edit_revision),
+            "dlc_path": self.dlc_path,
+            "is_parquet": self.dlc_path.lower().endswith(".parquet"),
+            "dlc_data": self.dlc_data.copy(deep=True),
+            "create_backup": (not self._dlc_backup_created) and dlc_file.exists() and not backup_file.exists(),
+            "export_frames": bool(export_frames),
+            "autosave": bool(autosave),
+            "pending_export_frames": (
+                {int(frame_num): sorted(tags) for frame_num, tags in self.pending_export_frames.items()}
+                if export_frames else {}
+            ),
+            "current_frame": int(self.current_frame),
+            "current_frame_bgr": (
+                self._last_rendered_bgr.copy()
+                if export_frames and self._last_rendered_bgr is not None else None
+            ),
+            "video_path": self.video_path,
+            "export_root": str(self.export_root) if self.export_root is not None else None,
+            "export_frames_dir": str(self.export_frames_dir) if self.export_frames_dir is not None else None,
+            "export_labels_dir": str(self.export_labels_dir) if self.export_labels_dir is not None else None,
+            "export_log_path": str(self.export_log_path) if self.export_log_path is not None else None,
+            "video_export_prefix": self.get_current_video_export_prefix(),
+            "editable_point_names": sorted(self.editable_point_names),
+            "coords_are_normalized": bool(self.coords_are_normalized),
+            "dlc_frame_map": dict(self.dlc_frame_map) if self.dlc_frame_map is not None else None,
+            "start_frame": int(self.start_frame),
+        }
+
+    def launch_save_worker(self, job: Dict[str, Any]):
+        """Start a background worker that writes DLC edits and optional exports."""
+        self._save_in_progress = True
+        self.set_save_ui_busy(
+            True,
+            export_frames=bool(job["export_frames"]),
+            autosave=bool(job["autosave"]),
+        )
+
+        self._save_thread = QThread(self)
+        self._save_worker = SaveExportWorker(job)
+        self._save_worker.moveToThread(self._save_thread)
+        self._save_thread.started.connect(self._save_worker.run)
+        self._save_worker.finished.connect(self.on_save_worker_finished)
+        self._save_worker.failed.connect(self.on_save_worker_failed)
+        self._save_worker.finished.connect(self._save_thread.quit)
+        self._save_worker.failed.connect(self._save_thread.quit)
+        self._save_worker.finished.connect(self._save_worker.deleteLater)
+        self._save_worker.failed.connect(self._save_worker.deleteLater)
+        self._save_thread.finished.connect(self._save_thread.deleteLater)
+        self._save_thread.finished.connect(self.on_save_thread_finished)
+        self._save_thread.start()
+
+    def on_save_thread_finished(self):
+        """Drop worker references after the background thread shuts down."""
+        self._save_thread = None
+        self._save_worker = None
+
+    @staticmethod
+    def _path_signature(path_text: Optional[str]) -> Optional[Tuple[int, int]]:
+        """Return a lightweight on-disk signature for change detection."""
+        if not path_text:
+            return None
+        try:
+            stat = Path(path_text).expanduser().stat()
+        except Exception:
+            return None
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+
+    @staticmethod
+    def _same_path(path_a: Optional[str], path_b: Optional[str]) -> bool:
+        """Best-effort path equality check across user-entered paths."""
+        if not path_a or not path_b:
+            return False
+        try:
+            return Path(path_a).expanduser().resolve() == Path(path_b).expanduser().resolve()
+        except Exception:
+            return str(Path(path_a).expanduser()) == str(Path(path_b).expanduser())
+
+    def remember_loaded_dlc_signature(self, path_text: Optional[str] = None):
+        """Remember the on-disk DLC state after a successful load/save."""
+        self._loaded_dlc_signature = self._path_signature(path_text or self.dlc_path)
+
+    def dlc_changed_on_disk(self, path_text: Optional[str] = None) -> bool:
+        """Detect external DLC modifications since the last load/save."""
+        target_path = path_text or self.dlc_path
+        if not target_path or self._loaded_dlc_signature is None:
+            return False
+        return self._path_signature(target_path) != self._loaded_dlc_signature
+
+    def clear_pending_save_state(self):
+        """Drop queued save/export state without mutating loaded DLC data."""
+        if self.save_timer.isActive():
+            self.save_timer.stop()
+        self.pending_export_frames = {}
+        self.pending_export_frame_revisions = {}
+        self._pending_save = False
+        self._save_followup_requested = False
+        self._save_followup_export = False
+
+    def note_unsaved_edit(self, message: str, rerender_preview: bool = False):
+        """Mark edits as pending and make it explicit that nothing was autosaved."""
+        if self.save_timer.isActive():
+            self.save_timer.stop()
+        if rerender_preview:
+            self.render_drag_preview()
+        self.set_edit_status(f"{message} Not saved yet. Click Save Edits Now to write DLC + exports.")
+
+    def confirm_discard_unsaved_reload(self, message: str) -> bool:
+        """Ask before discarding stale in-memory edits to reload from disk."""
+        reply = QMessageBox.warning(
+            self,
+            "Reload From Disk",
+            message,
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        return reply == QMessageBox.Yes
+
+    def queue_load_after_save(self, video_path: str, dlc_path: str, message: str):
+        """Save current work first, then load the requested files."""
+        self._load_after_save = True
+        self._load_after_save_paths = (video_path, dlc_path)
+        self.set_edit_status(message, is_error=False)
+        if not self._save_in_progress:
+            self.persist_dlc_edits(export_frames=True, autosave=False)
+
+    def maybe_continue_after_save(self):
+        """Run queued follow-up work after a save/export worker finishes."""
+        if self._save_in_progress:
+            return
+
+        if self._save_followup_requested:
+            export_frames = bool(self._save_followup_export)
+            self._save_followup_requested = False
+            self._save_followup_export = False
+            QTimer.singleShot(
+                0,
+                lambda: self.persist_dlc_edits(
+                    export_frames=export_frames,
+                    autosave=not export_frames,
+                ),
+            )
+            return
+
+        if self._load_after_save:
+            if self._pending_save or self.pending_export_frames:
+                QTimer.singleShot(0, lambda: self.persist_dlc_edits(export_frames=True, autosave=False))
+            else:
+                self._load_after_save = False
+                pending_paths = self._load_after_save_paths
+                self._load_after_save_paths = None
+                if pending_paths is not None:
+                    video_path, dlc_path = pending_paths
+                    self.video_input.setText(video_path)
+                    self.dlc_input.setText(dlc_path)
+                    QTimer.singleShot(0, self.load_files)
+            return
+
+        if self._close_after_save:
+            if self._pending_save or self.pending_export_frames:
+                QTimer.singleShot(0, lambda: self.persist_dlc_edits(export_frames=True, autosave=False))
+            else:
+                self.close()
+            return
+
+        if self._calibration_after_save:
+            if self._pending_save or self.pending_export_frames:
+                QTimer.singleShot(0, lambda: self.persist_dlc_edits(export_frames=True, autosave=False))
+            else:
+                self._calibration_after_save = False
+                QTimer.singleShot(0, self.start_reapply_calibration)
+            return
+
+        if self._retrain_after_save:
+            if self._pending_save or self.pending_export_frames:
+                QTimer.singleShot(0, lambda: self.persist_dlc_edits(export_frames=True, autosave=False))
+            else:
+                self._retrain_after_save = False
+                QTimer.singleShot(0, self.start_retrain_and_rerun)
+
+    def on_save_worker_finished(self, result: Dict[str, Any]):
+        """Apply background save/export results back onto UI state."""
+        self._save_in_progress = False
+        self.set_save_ui_busy(False)
+
+        if result.get("created_backup"):
+            self._dlc_backup_created = True
+
+        result_dlc_path = result.get("dlc_path")
+        snapshot_revision = int(result.get("revision", -1))
+        export_frames = bool(result.get("export_frames"))
+        autosave = bool(result.get("autosave"))
+        processed_frames = [int(frame_num) for frame_num in result.get("processed_frames", [])]
+
+        if result_dlc_path == self.dlc_path:
+            if export_frames:
+                for frame_num in processed_frames:
+                    frame_revision = int(self.pending_export_frame_revisions.get(frame_num, -1))
+                    if frame_revision <= snapshot_revision:
+                        self.pending_export_frames.pop(frame_num, None)
+                        self.pending_export_frame_revisions.pop(frame_num, None)
+            if self._edit_revision <= snapshot_revision:
+                self._pending_save = False
+            self.remember_loaded_dlc_signature(result_dlc_path)
+
+        dlc_file = result_dlc_path or self.dlc_path
+        if export_frames:
+            export_root_text = result.get("export_root") or "(not set)"
+            self.set_edit_status(
+                f"Saved edits to {dlc_file} ({int(result.get('exported_count', 0))} frame exports) -> {export_root_text}"
+            )
+        elif autosave:
+            self.set_edit_status(
+                f"Autosaved edits to {dlc_file} (data only; frame exports wait for Save Edits Now)."
+            )
+        else:
+            self.set_edit_status(f"Saved edits to {dlc_file}.")
+
+        self.maybe_continue_after_save()
+
+    def on_save_worker_failed(self, error_text: str):
+        """Surface background save/export failures without crashing the UI."""
+        self._save_in_progress = False
+        self.set_save_ui_busy(False)
+        self._save_followup_requested = False
+        self._save_followup_export = False
+        self._load_after_save = False
+        self._load_after_save_paths = None
+        self._close_after_save = False
+        self._retrain_after_save = False
+        short_error = error_text.strip().splitlines()[-1] if error_text.strip() else "unknown error"
+        self.set_edit_status(f"Failed saving DLC file: {short_error}", is_error=True)
+        print("Error saving edited DLC file:")
+        print(error_text)
     
     def label_to_frame_coords(self, label_x: int, label_y: int) -> Optional[Tuple[int, int]]:
         """Map click coordinates from QLabel space into original frame pixel space."""
@@ -1030,6 +1746,44 @@ class VideoOverlayPlayer(QMainWindow):
                     seen.add(conf_col)
         return cols
 
+    def get_point_confidence_value_from_data(self, row_data, point_name: str) -> Optional[float]:
+        """Read the first non-NaN confidence value available for a point from cached row data."""
+        for conf_col in self.get_point_confidence_columns(point_name):
+            try:
+                conf_val = row_data.get(conf_col, np.nan)
+            except Exception:
+                conf_val = np.nan
+            if pd.notna(conf_val):
+                try:
+                    return float(conf_val)
+                except Exception:
+                    continue
+        return None
+
+    def get_point_confidence_value(self, row_idx: int, point_name: str) -> Optional[float]:
+        """Read the first non-NaN confidence value available for a point."""
+        if self.dlc_data is None:
+            return None
+        return self.get_point_confidence_value_from_data(self.dlc_data.iloc[int(row_idx)], point_name)
+
+    def ensure_confidence_columns(self, point_names: Optional[List[str]] = None) -> int:
+        """Create per-point *_conf columns only when a point has no confidence storage at all."""
+        if self.dlc_data is None:
+            return 0
+        if point_names is None:
+            point_names = sorted(self.editable_point_names)
+
+        created = 0
+        for point_name in point_names:
+            if self.get_point_confidence_columns(point_name):
+                continue
+            conf_col = f"{point_name}_conf"
+            if conf_col in self.dlc_data.columns:
+                continue
+            self.dlc_data[conf_col] = np.nan
+            created += 1
+        return created
+
     def set_points_confidence_for_rows(
         self, row_indices: List[int], point_names, confidence_value: float
     ) -> int:
@@ -1058,6 +1812,49 @@ class VideoOverlayPlayer(QMainWindow):
         else:
             self.dlc_data.iloc[rows, col_indices] = np.full((len(rows), len(col_indices)), conf_val)
         return len(col_indices)
+
+    def find_ear_point_pair(self) -> Optional[Tuple[str, str]]:
+        """Detect a left/right ear pair among editable points."""
+        if not self.editable_point_names:
+            return None
+
+        original_by_lower = {point_name.lower(): point_name for point_name in self.editable_point_names}
+        for point_name in sorted(self.editable_point_names):
+            point_name_lower = point_name.lower()
+            if "ear" not in point_name_lower or "left" not in point_name_lower:
+                continue
+
+            candidate_lowers = []
+            if "left_" in point_name_lower:
+                candidate_lowers.append(point_name_lower.replace("left_", "right_", 1))
+            if "_left" in point_name_lower:
+                candidate_lowers.append(point_name_lower.replace("_left", "_right", 1))
+            candidate_lowers.append(point_name_lower.replace("left", "right", 1))
+
+            for candidate_lower in candidate_lowers:
+                candidate = original_by_lower.get(candidate_lower)
+                if candidate is not None and "ear" in candidate_lower:
+                    return point_name, candidate
+        return None
+
+    def refresh_flip_ears_button(self):
+        """Enable ear-swap only when the current DLC file has a left/right ear pair."""
+        if not hasattr(self, "flip_ears_btn"):
+            return
+        ear_pair = self.find_ear_point_pair()
+        self.flip_ears_btn.setEnabled(ear_pair is not None)
+        if hasattr(self, "flip_ears_range_btn"):
+            self.flip_ears_range_btn.setEnabled(ear_pair is not None)
+        if ear_pair is None:
+            self.flip_ears_btn.setToolTip("No left/right ear pair detected in the current DLC file.")
+            if hasattr(self, "flip_ears_range_btn"):
+                self.flip_ears_range_btn.setToolTip("No left/right ear pair detected in the current DLC file.")
+        else:
+            self.flip_ears_btn.setToolTip(f"Swap {ear_pair[0]} and {ear_pair[1]} on the current frame.")
+            if hasattr(self, "flip_ears_range_btn"):
+                self.flip_ears_range_btn.setToolTip(
+                    f"Swap {ear_pair[0]} and {ear_pair[1]} across an inclusive frame range."
+                )
     
     def find_nearest_point_for_edit(self, dlc_row_idx: int, frame_x: int, frame_y: int) -> Optional[str]:
         """Find nearest visible point to cursor for drag selection."""
@@ -1100,6 +1897,79 @@ class VideoOverlayPlayer(QMainWindow):
                 best_name = point_name
         
         return best_name
+
+    def get_editable_points_raw_for_row(self, dlc_row_idx: int) -> Dict[str, Tuple[float, float]]:
+        """Return editable points with valid coordinates for one DLC row."""
+        if self.dlc_data is None:
+            return {}
+
+        row = self.dlc_data.iloc[int(dlc_row_idx)]
+        points_raw = {}
+        for point_name in sorted(self.editable_point_names):
+            x_col = f"{point_name}_x"
+            y_col = f"{point_name}_y"
+            if x_col not in self.dlc_data.columns or y_col not in self.dlc_data.columns:
+                continue
+            x_val = row[x_col]
+            y_val = row[y_col]
+            if pd.isna(x_val) or pd.isna(y_val):
+                continue
+            try:
+                points_raw[point_name] = (float(x_val), float(y_val))
+            except Exception:
+                continue
+        return points_raw
+
+    def find_nose_point_for_rotation(self) -> Optional[str]:
+        """Find the editable nose point used as the rotation center."""
+        if not self.editable_point_names:
+            return None
+
+        by_lower = {point_name.lower(): point_name for point_name in self.editable_point_names}
+        for preferred in ("nose_cam", "nose"):
+            if preferred in by_lower:
+                return by_lower[preferred]
+
+        for point_name in sorted(self.editable_point_names):
+            if "nose" in point_name.lower():
+                return point_name
+        return None
+
+    def build_rotated_points_preview(self, frame_x: int, frame_y: int) -> Tuple[Dict[str, Tuple[float, float]], float]:
+        """Return rotated editable points around the nose center for the current mouse location."""
+        if self._last_rendered_frame_size is None:
+            return {}, 0.0
+        if (
+            self.drag_rotation_center_px is None
+            or self.drag_rotation_start_angle is None
+            or not self.drag_source_points_raw
+        ):
+            return {}, 0.0
+
+        frame_w, frame_h = self._last_rendered_frame_size
+        center_x, center_y = self.drag_rotation_center_px
+        lead_dx = float(frame_x) - float(center_x)
+        lead_dy = float(frame_y) - float(center_y)
+        if math.hypot(lead_dx, lead_dy) < 2.0:
+            return {}, 0.0
+
+        current_angle = math.atan2(lead_dy, lead_dx)
+        angle_delta = current_angle - float(self.drag_rotation_start_angle)
+        cos_a = math.cos(angle_delta)
+        sin_a = math.sin(angle_delta)
+        preview_points = {}
+
+        for point_name, (x_raw_start, y_raw_start) in self.drag_source_points_raw.items():
+            x_px_start, y_px_start = self.point_raw_to_pixels(x_raw_start, y_raw_start, frame_w, frame_h)
+            dx = float(x_px_start) - float(center_x)
+            dy = float(y_px_start) - float(center_y)
+            new_x_px = int(round(float(center_x) + cos_a * dx - sin_a * dy))
+            new_y_px = int(round(float(center_y) + sin_a * dx + cos_a * dy))
+            new_x_px = max(0, min(frame_w - 1, new_x_px))
+            new_y_px = max(0, min(frame_h - 1, new_y_px))
+            preview_points[point_name] = self.point_pixels_to_raw(new_x_px, new_y_px, frame_w, frame_h)
+
+        return preview_points, math.degrees(angle_delta)
     
     def update_dragged_point(self, frame_x: int, frame_y: int, commit: bool):
         """Apply point drag updates to in-memory DLC data, and optionally persist/export."""
@@ -1108,14 +1978,112 @@ class VideoOverlayPlayer(QMainWindow):
         if self._last_rendered_frame_size is None:
             return
         
-        point_name = self.dragging_point_name
         dlc_row_idx = self.dragging_dlc_row_idx
-        if point_name not in self.editable_point_names:
-            return
         frame_w, frame_h = self._last_rendered_frame_size
         
         frame_x = max(0, min(frame_w - 1, frame_x))
         frame_y = max(0, min(frame_h - 1, frame_y))
+
+        if self.drag_rotate_points:
+            preview_points, angle_degrees = self.build_rotated_points_preview(frame_x, frame_y)
+            if not preview_points:
+                return
+
+            if not commit:
+                self.drag_preview_points_raw = preview_points
+                self.drag_preview_raw = preview_points.get(self.dragging_point_name)
+                return
+
+            if self.drag_preview_points_raw:
+                preview_points = dict(self.drag_preview_points_raw)
+
+            rotated_point_names = []
+            for point_name, (x_raw, y_raw) in preview_points.items():
+                x_col = f"{point_name}_x"
+                y_col = f"{point_name}_y"
+                if x_col not in self.dlc_data.columns or y_col not in self.dlc_data.columns:
+                    continue
+                self.set_cell_value(dlc_row_idx, x_col, x_raw)
+                self.set_cell_value(dlc_row_idx, y_col, y_raw)
+                rotated_point_names.append(point_name)
+
+            if not rotated_point_names:
+                self.set_edit_status("Control-drag found no editable points to rotate.", is_error=True)
+                return
+
+            self.set_points_confidence_for_rows(
+                [int(dlc_row_idx)], rotated_point_names, self.manual_edit_confidence
+            )
+            self.drag_preview_raw = None
+            self.drag_preview_points_raw = {}
+
+            self._last_dlc_row_idx = None
+            edit_revision = self.begin_edit_revision()
+            self._pending_save = True
+            self.queue_pending_export(int(self.current_frame), rotated_point_names, edit_revision)
+            center_label = self.drag_rotation_center_point or "nose"
+            self.note_unsaved_edit(
+                f"Updated frame {self.current_frame}, rotated {len(rotated_point_names)} point(s) "
+                f"around {center_label} by {angle_degrees:.1f} deg "
+                f"(conf={self.manual_edit_confidence:.2f})."
+            )
+            return
+
+        if self.drag_all_points:
+            if self.drag_start_frame_pos is None or not self.drag_source_points_raw:
+                return
+
+            delta_x = frame_x - int(self.drag_start_frame_pos[0])
+            delta_y = frame_y - int(self.drag_start_frame_pos[1])
+            preview_points = {}
+
+            for point_name, (x_raw_start, y_raw_start) in self.drag_source_points_raw.items():
+                x_px_start, y_px_start = self.point_raw_to_pixels(x_raw_start, y_raw_start, frame_w, frame_h)
+                new_x_px = max(0, min(frame_w - 1, x_px_start + delta_x))
+                new_y_px = max(0, min(frame_h - 1, y_px_start + delta_y))
+                preview_points[point_name] = self.point_pixels_to_raw(new_x_px, new_y_px, frame_w, frame_h)
+
+            if not commit:
+                self.drag_preview_points_raw = preview_points
+                self.drag_preview_raw = preview_points.get(self.dragging_point_name)
+                return
+
+            if self.drag_preview_points_raw:
+                preview_points = dict(self.drag_preview_points_raw)
+
+            moved_point_names = []
+            for point_name, (x_raw, y_raw) in preview_points.items():
+                x_col = f"{point_name}_x"
+                y_col = f"{point_name}_y"
+                if x_col not in self.dlc_data.columns or y_col not in self.dlc_data.columns:
+                    continue
+                self.set_cell_value(dlc_row_idx, x_col, x_raw)
+                self.set_cell_value(dlc_row_idx, y_col, y_raw)
+                moved_point_names.append(point_name)
+
+            if not moved_point_names:
+                self.set_edit_status("Shift-drag found no editable points to update.", is_error=True)
+                return
+
+            self.set_points_confidence_for_rows(
+                [int(dlc_row_idx)], moved_point_names, self.manual_edit_confidence
+            )
+            self.drag_preview_raw = None
+            self.drag_preview_points_raw = {}
+
+            self._last_dlc_row_idx = None
+            edit_revision = self.begin_edit_revision()
+            self._pending_save = True
+            self.queue_pending_export(int(self.current_frame), moved_point_names, edit_revision)
+            self.note_unsaved_edit(
+                f"Updated frame {self.current_frame}, moved {len(moved_point_names)} point(s) together "
+                f"(dx={delta_x}, dy={delta_y}; conf={self.manual_edit_confidence:.2f})."
+            )
+            return
+
+        point_name = self.dragging_point_name
+        if point_name not in self.editable_point_names:
+            return
         
         x_col = f"{point_name}_x"
         y_col = f"{point_name}_y"
@@ -1143,11 +2111,11 @@ class VideoOverlayPlayer(QMainWindow):
         # Reset cached row so display uses latest values immediately.
         self._last_dlc_row_idx = None
         
+        edit_revision = self.begin_edit_revision()
         self._pending_save = True
-        self.pending_export_frames.setdefault(int(self.current_frame), set()).add(point_name)
-        self.save_timer.start(3000)
-        self.set_edit_status(
-            f"Updated frame {self.current_frame}, point '{point_name}' (conf={self.manual_edit_confidence:.2f}; autosave queued; click Save Edits Now to export frame+label files)."
+        self.queue_pending_export(int(self.current_frame), point_name, edit_revision)
+        self.note_unsaved_edit(
+            f"Updated frame {self.current_frame}, point '{point_name}' (conf={self.manual_edit_confidence:.2f})."
         )
     
     def on_video_mouse_press(self, event):
@@ -1177,15 +2145,81 @@ class VideoOverlayPlayer(QMainWindow):
         if point_name is None:
             self.set_edit_status("No nearby point found. Click closer to a dot.", is_error=True)
             return
-        
+
+        ctrl_pressed = bool(event.modifiers() & Qt.ControlModifier)
+        shift_pressed = bool(event.modifiers() & Qt.ShiftModifier) and not ctrl_pressed
         self.dragging_point_name = point_name
         self.dragging_dlc_row_idx = dlc_row_idx
         self.drag_start_frame = self.current_frame
+        self.drag_start_frame_pos = (int(frame_x), int(frame_y))
+        self.drag_all_points = shift_pressed
+        self.drag_rotate_points = ctrl_pressed
+        self.drag_source_points_raw = {}
         self.drag_preview_raw = None
+        self.drag_preview_points_raw = {}
+        self.drag_rotation_center_point = None
+        self.drag_rotation_center_px = None
+        self.drag_rotation_start_angle = None
+
+        if ctrl_pressed:
+            if self._last_rendered_frame_size is None:
+                self.clear_drag_state()
+                self.set_edit_status("Cannot rotate points before a frame is rendered.", is_error=True)
+                return
+
+            self.drag_source_points_raw = self.get_editable_points_raw_for_row(dlc_row_idx)
+            if not self.drag_source_points_raw:
+                self.clear_drag_state()
+                self.set_edit_status("No editable points with coordinates found for Control-drag.", is_error=True)
+                return
+
+            nose_point = self.find_nose_point_for_rotation()
+            if nose_point is None or nose_point not in self.drag_source_points_raw:
+                self.clear_drag_state()
+                self.set_edit_status("Control-drag needs a valid nose point to use as the rotation center.", is_error=True)
+                return
+
+            frame_w, frame_h = self._last_rendered_frame_size
+            center_raw = self.drag_source_points_raw[nose_point]
+            center_px = self.point_raw_to_pixels(center_raw[0], center_raw[1], frame_w, frame_h)
+            lead_raw = self.drag_source_points_raw.get(point_name)
+            if lead_raw is None:
+                self.clear_drag_state()
+                self.set_edit_status("Control-drag needs a point with valid coordinates to lead the rotation.", is_error=True)
+                return
+
+            lead_px = self.point_raw_to_pixels(lead_raw[0], lead_raw[1], frame_w, frame_h)
+            lead_dx = float(lead_px[0]) - float(center_px[0])
+            lead_dy = float(lead_px[1]) - float(center_px[1])
+            if math.hypot(lead_dx, lead_dy) < 2.0:
+                self.clear_drag_state()
+                self.set_edit_status("Control-drag needs a non-nose point away from the nose.", is_error=True)
+                return
+
+            self.drag_rotation_center_point = nose_point
+            self.drag_rotation_center_px = center_px
+            self.drag_rotation_start_angle = math.atan2(lead_dy, lead_dx)
+        elif shift_pressed:
+            self.drag_source_points_raw = self.get_editable_points_raw_for_row(dlc_row_idx)
+            if not self.drag_source_points_raw:
+                self.clear_drag_state()
+                self.set_edit_status("No editable points with coordinates found for Shift-drag.", is_error=True)
+                return
+
         self.video_label.setCursor(Qt.ClosedHandCursor)
         color = self.point_configs.get(point_name, {}).get("color", (255, 220, 0))
         self.video_label.set_drag_overlay((event.pos().x(), event.pos().y()), color=color)
-        self.set_edit_status(f"Dragging '{point_name}' on frame {self.current_frame}...")
+        if ctrl_pressed:
+            self.set_edit_status(
+                f"Control-dragging {len(self.drag_source_points_raw)} point(s) around "
+                f"{self.drag_rotation_center_point} on frame {self.current_frame}..."
+            )
+        elif shift_pressed:
+            self.set_edit_status(
+                f"Shift-dragging {len(self.drag_source_points_raw)} point(s) together on frame {self.current_frame}..."
+            )
+        else:
+            self.set_edit_status(f"Dragging '{point_name}' on frame {self.current_frame}...")
     
     def on_video_mouse_move(self, event):
         """Update dragged point while mouse moves."""
@@ -1203,6 +2237,7 @@ class VideoOverlayPlayer(QMainWindow):
         
         frame_x, frame_y = coords
         self.update_dragged_point(frame_x, frame_y, commit=False)
+        self.render_drag_preview()
         color = self.point_configs.get(self.dragging_point_name, {}).get("color", (255, 220, 0))
         label_coords = self.frame_to_label_coords(frame_x, frame_y)
         if label_coords is not None:
@@ -1219,16 +2254,25 @@ class VideoOverlayPlayer(QMainWindow):
         if coords is not None:
             frame_x, frame_y = coords
             self.update_dragged_point(frame_x, frame_y, commit=True)
-            self.display_frame()
         
         self.clear_drag_state()
+        if coords is not None:
+            self.display_frame()
     
     def clear_drag_state(self):
         """Reset drag interaction state when frame/navigation changes."""
         self.dragging_point_name = None
         self.dragging_dlc_row_idx = None
         self.drag_start_frame = None
+        self.drag_start_frame_pos = None
+        self.drag_all_points = False
+        self.drag_rotate_points = False
+        self.drag_source_points_raw = {}
         self.drag_preview_raw = None
+        self.drag_preview_points_raw = {}
+        self.drag_rotation_center_point = None
+        self.drag_rotation_center_px = None
+        self.drag_rotation_start_angle = None
         self.video_label.set_drag_overlay(None)
         self.video_label.setCursor(Qt.CrossCursor if self.edit_mode else Qt.ArrowCursor)
     
@@ -1259,12 +2303,13 @@ class VideoOverlayPlayer(QMainWindow):
         
         self._last_dlc_row_idx = None
         self.drag_preview_raw = None
+        self.drag_preview_points_raw = {}
+        edit_revision = self.begin_edit_revision()
         self._pending_save = True
-        self.pending_export_frames.setdefault(int(self.current_frame), set()).add("NO_HEAD")
-        self.save_timer.start(3000)
-        self.render_drag_preview()
-        self.set_edit_status(
-            f"Frame {self.current_frame}: set to NO_HEAD (autosave queued; click Save Edits Now to export; cleared {cleared} points)."
+        self.queue_pending_export(int(self.current_frame), "NO_HEAD", edit_revision)
+        self.note_unsaved_edit(
+            f"Frame {self.current_frame}: set to NO_HEAD (cleared {cleared} points).",
+            rerender_preview=True,
         )
 
     def clear_selected_point_current_frame(self):
@@ -1303,13 +2348,148 @@ class VideoOverlayPlayer(QMainWindow):
 
         self._last_dlc_row_idx = None
         self.drag_preview_raw = None
+        self.drag_preview_points_raw = {}
+        edit_revision = self.begin_edit_revision()
         self._pending_save = True
-        self.pending_export_frames.setdefault(int(self.current_frame), set()).add(f"CLEAR:{point_name}")
-        self.save_timer.start(3000)
-        self.render_drag_preview()
-        self.set_edit_status(
-            f"Frame {self.current_frame}: cleared '{point_name}' (set to NaN; autosave queued; click Save Edits Now to export)."
+        self.queue_pending_export(int(self.current_frame), f"CLEAR:{point_name}", edit_revision)
+        self.note_unsaved_edit(
+            f"Frame {self.current_frame}: cleared '{point_name}' (set to NaN).",
+            rerender_preview=True,
         )
+
+    def flip_ear_points_current_frame(self):
+        """Swap left/right ear coordinates on the current frame and mark both as manually edited."""
+        if self.dlc_data is None or self.cap is None:
+            self.set_edit_status("Load video + DLC first.", is_error=True)
+            return
+
+        ear_pair = self.find_ear_point_pair()
+        if ear_pair is None:
+            self.set_edit_status("No left/right ear pair found in this DLC file.", is_error=True)
+            return
+
+        dlc_row_idx = self.get_dlc_row_for_frame(self.current_frame)
+        if dlc_row_idx is None:
+            self.set_edit_status("No DLC row for this frame.", is_error=True)
+            return
+
+        left_point, right_point = ear_pair
+        swapped_axes = 0
+        for suffix in ("_x", "_y"):
+            left_col = f"{left_point}{suffix}"
+            right_col = f"{right_point}{suffix}"
+            if left_col not in self.dlc_data.columns or right_col not in self.dlc_data.columns:
+                self.set_edit_status(
+                    f"Missing coordinate columns for ear swap ({left_col}, {right_col}).",
+                    is_error=True,
+                )
+                return
+
+            left_val = self.get_cell_value(dlc_row_idx, left_col)
+            right_val = self.get_cell_value(dlc_row_idx, right_col)
+            self.set_cell_value(dlc_row_idx, left_col, right_val)
+            self.set_cell_value(dlc_row_idx, right_col, left_val)
+            swapped_axes += 1
+
+        self.ensure_confidence_columns([left_point, right_point])
+        conf_updates = self.set_points_confidence_for_rows(
+            [int(dlc_row_idx)], [left_point, right_point], self.manual_edit_confidence
+        )
+
+        self._last_dlc_row_idx = None
+        self.drag_preview_raw = None
+        self.drag_preview_points_raw = {}
+        edit_revision = self.begin_edit_revision()
+        self._pending_save = True
+        self.queue_pending_export(int(self.current_frame), [left_point, right_point], edit_revision)
+        self.note_unsaved_edit(
+            f"Frame {self.current_frame}: swapped {left_point} <-> {right_point} "
+            f"(axes={swapped_axes}; conf={self.manual_edit_confidence:.2f}; conf_cols={conf_updates}).",
+            rerender_preview=True,
+        )
+
+    def flip_ear_points_frame_range(self, start_frame: int, end_frame: int) -> bool:
+        """Swap left/right ear coordinates across an inclusive frame range."""
+        if self.dlc_data is None or self.cap is None:
+            self.set_edit_status("Load video + DLC first.", is_error=True)
+            return False
+        if self.total_frames <= 0:
+            self.set_edit_status("Video metadata missing; reload files and try again.", is_error=True)
+            return False
+
+        ear_pair = self.find_ear_point_pair()
+        if ear_pair is None:
+            self.set_edit_status("No left/right ear pair found in this DLC file.", is_error=True)
+            return False
+
+        left_point, right_point = ear_pair
+        step = 1 if end_frame >= start_frame else -1
+        target_frames = list(range(int(start_frame), int(end_frame) + step, step))
+        if not target_frames:
+            self.set_edit_status("No frames selected for ear flip.", is_error=True)
+            return False
+
+        row_to_frames: Dict[int, List[int]] = {}
+        skipped_unmapped = 0
+        edit_revision = self.begin_edit_revision()
+        for frame_num in target_frames:
+            dlc_row_idx = self.get_dlc_row_for_frame(int(frame_num))
+            if dlc_row_idx is None:
+                skipped_unmapped += 1
+                continue
+            row_to_frames.setdefault(int(dlc_row_idx), []).append(int(frame_num))
+            self.queue_pending_export(int(frame_num), [left_point, right_point], edit_revision)
+
+        if not row_to_frames:
+            self.set_edit_status("Flip L/R ears range: no frames mapped to a DLC row.", is_error=True)
+            return False
+
+        swapped_axes = 0
+        for suffix in ("_x", "_y"):
+            left_col = f"{left_point}{suffix}"
+            right_col = f"{right_point}{suffix}"
+            if left_col not in self.dlc_data.columns or right_col not in self.dlc_data.columns:
+                self.set_edit_status(
+                    f"Missing coordinate columns for ear swap ({left_col}, {right_col}).",
+                    is_error=True,
+                )
+                return False
+
+            unique_rows = sorted(row_to_frames.keys())
+            left_vals = self.dlc_data.loc[unique_rows, left_col].copy()
+            right_vals = self.dlc_data.loc[unique_rows, right_col].copy()
+            self.dlc_data.loc[unique_rows, left_col] = right_vals.to_numpy()
+            self.dlc_data.loc[unique_rows, right_col] = left_vals.to_numpy()
+            swapped_axes += 1
+
+        self.ensure_confidence_columns([left_point, right_point])
+        conf_updates = self.set_points_confidence_for_rows(
+            sorted(row_to_frames.keys()), [left_point, right_point], self.manual_edit_confidence
+        )
+
+        self._last_dlc_row_idx = None
+        self.drag_preview_raw = None
+        self.drag_preview_points_raw = {}
+        self._pending_save = True
+
+        touched_frames = sum(len(frames) for frames in row_to_frames.values())
+        duplicate_row_frames = touched_frames - len(row_to_frames)
+        status_bits = [
+            f"Flip L/R ears {start_frame}->{end_frame}: swapped {left_point} <-> {right_point}",
+            f"frames={touched_frames}/{len(target_frames)}",
+            f"rows={len(row_to_frames)}",
+            f"axes={swapped_axes}",
+            f"conf={self.manual_edit_confidence:.2f}",
+            f"conf_cols={conf_updates}",
+        ]
+        if skipped_unmapped:
+            status_bits.append(f"skipped {skipped_unmapped} unmapped frame(s)")
+        if duplicate_row_frames:
+            status_bits.append(f"{duplicate_row_frames} frame(s) shared a DLC row")
+
+        rerender_preview = any(int(self.current_frame) in frames for frames in row_to_frames.values())
+        self.note_unsaved_edit("; ".join(status_bits) + ".", rerender_preview=rerender_preview)
+        return True
 
     def refresh_clear_point_combo(self, point_names: Optional[List[str]] = None):
         """Refresh point dropdown used by per-point clear action."""
@@ -1332,6 +2512,7 @@ class VideoOverlayPlayer(QMainWindow):
             self.clear_point_combo.setEnabled(False)
             self.clear_point_btn.setEnabled(False)
         self.clear_point_combo.blockSignals(False)
+        self.refresh_flip_ears_button()
 
     def get_editable_copy_spec(self) -> Tuple[List[int], int]:
         """Return dataframe column indexes to copy for editable points."""
@@ -1367,104 +2548,67 @@ class VideoOverlayPlayer(QMainWindow):
 
         return col_indices, copied_points
 
-    def copy_editable_points_between_rows(self, source_row_idx: int, target_row_idx: int) -> int:
-        """Copy editable point coordinates/confidence from source DLC row to target row."""
-        if self.dlc_data is None:
-            return 0
-
-        col_indices, copied_points = self.get_editable_copy_spec()
-        if not col_indices:
-            return 0
-
-        source_values = self.dlc_data.iloc[int(source_row_idx), col_indices].to_numpy(copy=True)
-        self.dlc_data.iloc[int(target_row_idx), col_indices] = source_values
-        return copied_points
-
-    def apply_previous_frame_to_current(self):
-        """Copy previous frame *_cam values into current frame."""
+    def copy_source_frame_to_target_frames(
+        self,
+        source_frame: int,
+        target_frames: List[int],
+        export_tag: str,
+        action_label: str,
+    ) -> bool:
+        """Copy editable points from one source frame into a list of target frames."""
         if self.dlc_data is None or self.cap is None:
             self.set_edit_status("Load video + DLC first.", is_error=True)
-            return
+            return False
         if not self.editable_point_names:
             self.set_edit_status("No editable points found for this file.", is_error=True)
-            return
-        
-        prev_frame = self.current_frame - 1
-        if prev_frame < 0:
-            self.set_edit_status("No previous frame available.", is_error=True)
-            return
-        
-        curr_row_idx = self.get_dlc_row_for_frame(self.current_frame)
-        prev_row_idx = self.get_dlc_row_for_frame(prev_frame)
-        if curr_row_idx is None or prev_row_idx is None:
-            self.set_edit_status("Could not map current/previous frame to DLC rows.", is_error=True)
-            return
-
-        copied = self.copy_editable_points_between_rows(prev_row_idx, curr_row_idx)
-        self.set_points_confidence_for_rows(
-            [int(curr_row_idx)], self.editable_point_names, self.manual_edit_confidence
-        )
-
-        self._last_dlc_row_idx = None
-        self.drag_preview_raw = None
-        self._pending_save = True
-        self.pending_export_frames.setdefault(int(self.current_frame), set()).add("APPLY_PREV")
-        self.save_timer.start(3000)
-        self.render_drag_preview()
-        self.set_edit_status(
-            f"Copied previous frame points into frame {self.current_frame} "
-            f"(copied {copied}; conf={self.manual_edit_confidence:.2f}; click Save Edits Now to export)."
-        )
-
-    def apply_current_frame_to_next_10(self):
-        """Copy current frame *_cam values into the next 10 video frames."""
-        if self.dlc_data is None or self.cap is None:
-            self.set_edit_status("Load video + DLC first.", is_error=True)
-            return
-        if not self.editable_point_names:
-            self.set_edit_status("No editable points found for this file.", is_error=True)
-            return
+            return False
         if self.total_frames <= 0:
             self.set_edit_status("Video metadata missing; reload files and try again.", is_error=True)
-            return
+            return False
+        if not target_frames:
+            self.set_edit_status("No target frames selected.", is_error=True)
+            return False
 
-        source_row_idx = self.get_dlc_row_for_frame(self.current_frame)
+        source_row_idx = self.get_dlc_row_for_frame(int(source_frame))
         if source_row_idx is None:
-            self.set_edit_status("Could not map current frame to a DLC row.", is_error=True)
-            return
+            self.set_edit_status(f"Could not map source frame {source_frame} to a DLC row.", is_error=True)
+            return False
 
-        col_indices, copied_points_per_frame = self.get_editable_copy_spec()
-        if not col_indices or copied_points_per_frame == 0:
+        col_indices, copied_points_per_row = self.get_editable_copy_spec()
+        if not col_indices or copied_points_per_row == 0:
             self.set_edit_status("No editable point columns available to copy.", is_error=True)
-            return
+            return False
 
-        start_target_frame = self.current_frame + 1
-        if start_target_frame >= self.total_frames:
-            self.set_edit_status("No next frame available.", is_error=True)
-            return
-
-        end_target_frame = min(self.current_frame + 10, self.total_frames - 1)
-        attempted_frames = (end_target_frame - start_target_frame) + 1
         mapped_target_rows = []
-        skipped_frames = 0
+        skipped_unmapped = 0
+        skipped_same_row = 0
 
-        for target_frame in range(start_target_frame, end_target_frame + 1):
-            target_row_idx = self.get_dlc_row_for_frame(target_frame)
+        edit_revision = self.begin_edit_revision()
+        for target_frame in target_frames:
+            target_row_idx = self.get_dlc_row_for_frame(int(target_frame))
             if target_row_idx is None:
-                skipped_frames += 1
+                skipped_unmapped += 1
+                continue
+            if int(target_row_idx) == int(source_row_idx):
+                skipped_same_row += 1
                 continue
 
-            mapped_target_rows.append(int(target_row_idx))
-            self.pending_export_frames.setdefault(int(target_frame), set()).add("APPLY_NEXT10")
+            mapped_target_rows.append((int(target_frame), int(target_row_idx)))
+            self.queue_pending_export(int(target_frame), export_tag, edit_revision)
 
         if not mapped_target_rows:
-            self.set_edit_status("Could not map any of the next 10 frames to DLC rows.", is_error=True)
-            return
+            self.set_edit_status(
+                f"{action_label}: no target frames mapped to a different DLC row.",
+                is_error=True,
+            )
+            return False
 
         unique_target_rows = []
         seen_rows = set()
-        for row_idx in mapped_target_rows:
+        duplicate_row_targets = 0
+        for _, row_idx in mapped_target_rows:
             if row_idx in seen_rows:
+                duplicate_row_targets += 1
                 continue
             seen_rows.add(row_idx)
             unique_target_rows.append(row_idx)
@@ -1476,21 +2620,142 @@ class VideoOverlayPlayer(QMainWindow):
             unique_target_rows, self.editable_point_names, self.manual_edit_confidence
         )
 
-        applied_frames = len(unique_target_rows)
-        copied_total = copied_points_per_frame * applied_frames
-
         self._last_dlc_row_idx = None
         self.drag_preview_raw = None
+        self.drag_preview_points_raw = {}
         self._pending_save = True
-        self.save_timer.start(3000)
         self.render_drag_preview()
 
-        skipped_text = f"; skipped {skipped_frames} unmapped frame(s)" if skipped_frames else ""
-        self.set_edit_status(
-            f"Copied current frame into {applied_frames}/{attempted_frames} next frame(s) "
-            f"({start_target_frame}-{end_target_frame}; copied {copied_total} point sets; "
-            f"conf={self.manual_edit_confidence:.2f}{skipped_text}; "
-            "click Save Edits Now to export)."
+        touched_frame_count = len(mapped_target_rows)
+        copied_total = copied_points_per_row * len(unique_target_rows)
+        status_bits = [
+            f"{action_label}: copied frame {source_frame} into {touched_frame_count}/{len(target_frames)} target frame(s)",
+            f"updated {len(unique_target_rows)} DLC row(s)",
+            f"copied {copied_total} point sets",
+            f"conf={self.manual_edit_confidence:.2f}",
+        ]
+        if skipped_unmapped:
+            status_bits.append(f"skipped {skipped_unmapped} unmapped frame(s)")
+        if skipped_same_row:
+            status_bits.append(f"skipped {skipped_same_row} same-row frame(s)")
+        if duplicate_row_targets:
+            status_bits.append(f"{duplicate_row_targets} frame(s) shared a DLC row")
+
+        self.note_unsaved_edit("; ".join(status_bits) + ".")
+        return True
+
+    def prompt_copy_source_frame_range(self):
+        """Ask for source/till frames and copy editable points across that range."""
+        if self.dlc_data is None or self.cap is None:
+            self.set_edit_status("Load video + DLC first.", is_error=True)
+            return
+        if self.total_frames <= 0:
+            self.set_edit_status("Video metadata missing; reload files and try again.", is_error=True)
+            return
+
+        min_frame = max(0, int(self.start_frame))
+        max_frame = max(min_frame, int(self.total_frames - 1))
+
+        default_source = max(min_frame, min(max_frame, int(self.current_frame)))
+        if default_source < max_frame:
+            default_till = min(max_frame, default_source + 10)
+        else:
+            default_till = max(min_frame, default_source - 10)
+
+        dialog = CopyFrameRangeDialog(
+            min_frame=min_frame,
+            max_frame=max_frame,
+            source_frame=default_source,
+            till_frame=default_till,
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        source_frame, till_frame = dialog.get_selected_frames()
+        if source_frame == till_frame:
+            self.set_edit_status("Source frame and till frame must be different.", is_error=True)
+            return
+
+        step = 1 if till_frame > source_frame else -1
+        target_frames = list(range(source_frame + step, till_frame + step, step))
+        self.copy_source_frame_to_target_frames(
+            source_frame=source_frame,
+            target_frames=target_frames,
+            export_tag=f"APPLY_RANGE:{source_frame}->{till_frame}",
+            action_label=f"Range apply {source_frame}->{till_frame}",
+        )
+
+    def prompt_flip_ears_frame_range(self):
+        """Ask for an inclusive frame range and swap left/right ears across it."""
+        if self.dlc_data is None or self.cap is None:
+            self.set_edit_status("Load video + DLC first.", is_error=True)
+            return
+        if self.total_frames <= 0:
+            self.set_edit_status("Video metadata missing; reload files and try again.", is_error=True)
+            return
+
+        ear_pair = self.find_ear_point_pair()
+        if ear_pair is None:
+            self.set_edit_status("No left/right ear pair found in this DLC file.", is_error=True)
+            return
+
+        min_frame = max(0, int(self.start_frame))
+        max_frame = max(min_frame, int(self.total_frames - 1))
+        default_start = max(min_frame, min(max_frame, int(self.current_frame)))
+        default_end = min(max_frame, default_start + 10) if default_start < max_frame else default_start
+
+        dialog = FrameRangeDialog(
+            title="Flip L/R Ears Across Frames",
+            description=(
+                f"Swap {ear_pair[0]} and {ear_pair[1]} coordinates on every frame in the inclusive range."
+            ),
+            start_label="Start frame:",
+            end_label="End frame:",
+            min_frame=min_frame,
+            max_frame=max_frame,
+            start_frame=default_start,
+            end_frame=default_end,
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        start_frame, end_frame = dialog.get_selected_frames()
+        self.flip_ear_points_frame_range(start_frame, end_frame)
+
+    def apply_previous_frame_to_current(self):
+        """Copy previous frame *_cam values into current frame."""
+        prev_frame = self.current_frame - 1
+        if prev_frame < 0:
+            self.set_edit_status("No previous frame available.", is_error=True)
+            return
+
+        self.copy_source_frame_to_target_frames(
+            source_frame=prev_frame,
+            target_frames=[int(self.current_frame)],
+            export_tag="APPLY_PREV",
+            action_label="Apply prev -> current",
+        )
+
+    def apply_current_frame_to_next_10(self):
+        """Copy current frame *_cam values into the next 10 video frames."""
+        if self.total_frames <= 0:
+            self.set_edit_status("Video metadata missing; reload files and try again.", is_error=True)
+            return
+
+        start_target_frame = self.current_frame + 1
+        if start_target_frame >= self.total_frames:
+            self.set_edit_status("No next frame available.", is_error=True)
+            return
+
+        end_target_frame = min(self.current_frame + 10, self.total_frames - 1)
+
+        self.copy_source_frame_to_target_frames(
+            source_frame=int(self.current_frame),
+            target_frames=list(range(start_target_frame, end_target_frame + 1)),
+            export_tag="APPLY_NEXT10",
+            action_label=f"Apply current -> next 10 ({start_target_frame}-{end_target_frame})",
         )
     
     def update_video_display(self, frame_rgb: np.ndarray, fast: bool = False):
@@ -1548,6 +2813,11 @@ class VideoOverlayPlayer(QMainWindow):
             x_val = row[x_col]
             y_val = row[y_col]
             if (
+                self.dragging_dlc_row_idx == dlc_row_idx
+                and point_name in self.drag_preview_points_raw
+            ):
+                x_val, y_val = self.drag_preview_points_raw[point_name]
+            elif (
                 self.dragging_point_name == point_name
                 and self.dragging_dlc_row_idx == dlc_row_idx
                 and self.drag_preview_raw is not None
@@ -1556,18 +2826,33 @@ class VideoOverlayPlayer(QMainWindow):
             if pd.isna(x_val) or pd.isna(y_val):
                 point_coords_text.append(f"{point_name}: NaN")
                 continue
-            
+
             x_px, y_px = self.point_raw_to_pixels(float(x_val), float(y_val), frame_w, frame_h)
+            conf_val = self.get_point_confidence_value_from_data(row, point_name)
             color = config["color"]
             is_dragging_this_point = (
-                self.dragging_point_name == point_name and self.dragging_dlc_row_idx == dlc_row_idx
+                self.dragging_dlc_row_idx == dlc_row_idx
+                and (
+                    (
+                        (self.drag_all_points or self.drag_rotate_points)
+                        and point_name in self.drag_source_points_raw
+                    )
+                    or (
+                        not self.drag_all_points
+                        and not self.drag_rotate_points
+                        and self.dragging_point_name == point_name
+                    )
+                )
             )
             dot_radius = 8 if is_dragging_this_point else 5
             ring_radius = 11 if is_dragging_this_point else 7
             ring_color = (255, 220, 0) if is_dragging_this_point else (255, 255, 255)
             cv2.circle(frame_rgb, (x_px, y_px), dot_radius, color, -1)
             cv2.circle(frame_rgb, (x_px, y_px), ring_radius, ring_color, 2 if is_dragging_this_point else 1)
-            point_coords_text.append(f"{point_name}: ({x_px}, {y_px})")
+            if conf_val is not None:
+                point_coords_text.append(f"{point_name}: ({x_px}, {y_px}) conf={conf_val:.2f}")
+            else:
+                point_coords_text.append(f"{point_name}: ({x_px}, {y_px})")
         
         self.update_video_display(frame_rgb, fast=True)
         if point_coords_text:
@@ -1712,58 +2997,158 @@ class VideoOverlayPlayer(QMainWindow):
         self.pending_export_frames.clear()
     
     def autosave_edits(self):
-        """Lightweight autosave path (data only, no frame exports)."""
-        self.persist_dlc_edits(export_frames=False, autosave=True)
+        """Autosave is intentionally disabled; keep reminding the user to save explicitly."""
+        if self.save_timer.isActive():
+            self.save_timer.stop()
+        if self._pending_save or self.pending_export_frames:
+            self.set_edit_status(
+                "Autosave is disabled. Click Save Edits Now to write DLC + exports.",
+                is_error=False,
+            )
     
     def persist_dlc_edits(self, export_frames: bool = True, autosave: bool = False):
-        """Write edited DLC dataframe back to source file."""
+        """Snapshot edits and write DLC data in a background worker."""
         if self.dlc_data is None or not self.dlc_path:
             return
         if self.save_timer.isActive():
             self.save_timer.stop()
-        if not self._pending_save and (not self.pending_export_frames or not export_frames):
-            self.set_edit_status("No pending edits to save.")
+        if self.dlc_changed_on_disk():
+            if autosave:
+                self.set_edit_status(
+                    "Autosave paused because the DLC file changed on disk. Reload it before saving again.",
+                    is_error=True,
+                )
+            else:
+                self.set_edit_status(
+                    "DLC file changed on disk. Reload it before saving to avoid overwriting newer changes.",
+                    is_error=True,
+                )
             return
-        
-        dlc_file = Path(self.dlc_path)
-        is_parquet = self.dlc_path.lower().endswith(".parquet")
-        if is_parquet:
-            tmp_file = dlc_file.with_name(dlc_file.name + ".tmp.parquet")
-        else:
-            tmp_file = dlc_file.with_name(dlc_file.name + ".tmp.csv")
-        backup_file = dlc_file.with_suffix(dlc_file.suffix + ".bak")
-        
-        try:
-            if not self._dlc_backup_created and dlc_file.exists() and not backup_file.exists():
-                shutil.copy2(dlc_file, backup_file)
-                self._dlc_backup_created = True
-            
-            if is_parquet:
-                self.dlc_data.to_parquet(tmp_file, index=False)
-            else:
-                self.dlc_data.to_csv(tmp_file, index=False)
-            
-            tmp_file.replace(dlc_file)
-            self._pending_save = False
-            
-            if export_frames:
-                exported_count = len(self.pending_export_frames)
-                self.export_pending_frames()
-                export_root_text = str(self.export_root) if self.export_root else "(not set)"
-                self.set_edit_status(
-                    f"Saved edits to {dlc_file} ({exported_count} frame exports) -> {export_root_text}"
-                )
-            elif autosave:
-                self.set_edit_status(
-                    f"Autosaved edits to {dlc_file} (data only; frame exports wait for Save Edits Now)."
-                )
-            else:
-                self.set_edit_status(f"Saved edits to {dlc_file}.")
-        except Exception as e:
-            self.set_edit_status(f"Failed saving DLC file: {e}", is_error=True)
-            print(f"Error saving edited DLC file: {e}")
-            import traceback
-            traceback.print_exc()
+        if not self._pending_save and (not self.pending_export_frames or not export_frames):
+            if not autosave:
+                self.set_edit_status("No pending edits to save.")
+            return
+
+        if self._save_in_progress:
+            self._save_followup_requested = True
+            self._save_followup_export = self._save_followup_export or export_frames
+            if not autosave:
+                self.set_edit_status("Save already in progress. Queued another save.")
+            return
+
+        job = self.build_save_job(export_frames=export_frames, autosave=autosave)
+        self.launch_save_worker(job)
+
+    def refresh_background_action_buttons(self):
+        """Keep retrain/calibration buttons in sync with background jobs."""
+        retrain_running = self.retrain_process is not None and self.retrain_process.poll() is None
+        calibration_running = bool(self._calibration_in_progress)
+        actions_busy = retrain_running or calibration_running
+        if hasattr(self, "retrain_btn"):
+            self.retrain_btn.setEnabled(not actions_busy)
+        if hasattr(self, "reapply_calibration_btn"):
+            self.reapply_calibration_btn.setEnabled(not actions_busy)
+
+    def set_calibration_status(self, message: str, is_error: bool = False):
+        """Update calibration workflow status line."""
+        color = "#A91E2C" if is_error else "#1F4B99"
+        self.calibration_status_label.setStyleSheet(f"font-size: 8.5pt; color: {color};")
+        self.calibration_status_label.setText(message)
+
+    def build_calibration_job(self) -> Dict[str, Any]:
+        """Capture the current DLC/video context for recalibration."""
+        calibration_dir = (
+            str(self.default_calibration_dir)
+            if self.default_calibration_dir is not None else None
+        )
+        return {
+            "pose_file": self.dlc_path,
+            "video_path": self.video_path,
+            "calibration_dir": calibration_dir,
+        }
+
+    def launch_calibration_worker(self, job: Dict[str, Any]):
+        """Run calibration helper in a background thread."""
+        self._calibration_in_progress = True
+        self.refresh_background_action_buttons()
+
+        self._calibration_thread = QThread(self)
+        self._calibration_worker = CalibrationWorker(job)
+        self._calibration_worker.moveToThread(self._calibration_thread)
+        self._calibration_thread.started.connect(self._calibration_worker.run)
+        self._calibration_worker.finished.connect(self.on_calibration_worker_finished)
+        self._calibration_worker.failed.connect(self.on_calibration_worker_failed)
+        self._calibration_worker.finished.connect(self._calibration_thread.quit)
+        self._calibration_worker.failed.connect(self._calibration_thread.quit)
+        self._calibration_worker.finished.connect(self._calibration_worker.deleteLater)
+        self._calibration_worker.failed.connect(self._calibration_worker.deleteLater)
+        self._calibration_thread.finished.connect(self._calibration_thread.deleteLater)
+        self._calibration_thread.finished.connect(self.on_calibration_thread_finished)
+        self._calibration_thread.start()
+
+    def on_calibration_thread_finished(self):
+        """Drop worker references once the calibration thread exits."""
+        self._calibration_thread = None
+        self._calibration_worker = None
+
+    def start_reapply_calibration(self):
+        """Save current edits if needed, then reapply calibration to the loaded DLC file."""
+        if self._save_in_progress or self._pending_save or self.pending_export_frames:
+            self._calibration_after_save = True
+            self.set_calibration_status("Saving edits before calibration...", is_error=False)
+            self.persist_dlc_edits(export_frames=True, autosave=False)
+            return
+
+        if self._calibration_in_progress:
+            self.set_calibration_status("Calibration is already running. Wait for completion.", is_error=True)
+            return
+        if self.retrain_process is not None and self.retrain_process.poll() is None:
+            self.set_calibration_status("Retrain is already running. Wait for completion.", is_error=True)
+            return
+        if self.video_path is None or self.dlc_data is None or not self.dlc_path:
+            self.set_calibration_status("Load video + DLC first.", is_error=True)
+            return
+        if run_edited_pose_calibration_job is None:
+            self.set_calibration_status(
+                f"Calibration helper unavailable: {CALIBRATION_HELPER_IMPORT_ERROR}",
+                is_error=True,
+            )
+            return
+
+        self.set_calibration_status(
+            f"Reapplying calibration to {Path(self.dlc_path).name}...",
+            is_error=False,
+        )
+        self.launch_calibration_worker(self.build_calibration_job())
+
+    def on_calibration_worker_finished(self, result: Dict[str, Any]):
+        """Handle successful recalibration and reload the current DLC file from disk."""
+        self._calibration_in_progress = False
+        self.refresh_background_action_buttons()
+        updated_cells = int(result.get("updated_cells", 0))
+        output_path = result.get("output_path") or self.dlc_path
+        self.set_calibration_status(
+            f"Calibration finished ({updated_cells} calibrated cells).",
+            is_error=False,
+        )
+        self.set_edit_status(
+            f"Calibration finished for {output_path}. Reloading DLC from disk...",
+            is_error=False,
+        )
+        if self._close_after_calibration:
+            self._close_after_calibration = False
+            QTimer.singleShot(0, self.close)
+            return
+        QTimer.singleShot(0, self.load_files)
+
+    def on_calibration_worker_failed(self, error_text: str):
+        """Surface calibration failures without crashing the UI."""
+        self._calibration_in_progress = False
+        self.refresh_background_action_buttons()
+        self._close_after_calibration = False
+        summary = error_text.strip().splitlines()[-1] if error_text.strip() else "Unknown calibration failure"
+        self.set_calibration_status(f"Calibration failed: {summary}", is_error=True)
+        self.set_edit_status("Calibration failed. See console output for details.", is_error=True)
     
     def set_retrain_status(self, message: str, is_error: bool = False):
         """Update retrain workflow status line."""
@@ -1773,6 +3158,15 @@ class VideoOverlayPlayer(QMainWindow):
     
     def start_retrain_and_rerun(self):
         """Run external retrain helper script asynchronously, then optional rerun."""
+        if self._save_in_progress or self._pending_save or self.pending_export_frames:
+            self._retrain_after_save = True
+            self.set_retrain_status("Saving edits and exporting labels before retrain...", is_error=False)
+            self.persist_dlc_edits(export_frames=True, autosave=False)
+            return
+
+        if self._calibration_in_progress:
+            self.set_retrain_status("Calibration is already running. Wait for completion.", is_error=True)
+            return
         if self.retrain_process is not None and self.retrain_process.poll() is None:
             self.set_retrain_status("Retrain is already running. Wait for completion.", is_error=True)
             return
@@ -1858,7 +3252,7 @@ class VideoOverlayPlayer(QMainWindow):
                 stdout=self.retrain_log_handle,
                 stderr=subprocess.STDOUT
             )
-            self.retrain_btn.setEnabled(False)
+            self.refresh_background_action_buttons()
             self.retrain_poll_timer.start(1000)
             self.set_retrain_status(
                 f"Retrain started (PID {self.retrain_process.pid}). Log: {self.retrain_log_path}"
@@ -1880,7 +3274,7 @@ class VideoOverlayPlayer(QMainWindow):
             return
         
         self.retrain_poll_timer.stop()
-        self.retrain_btn.setEnabled(True)
+        self.refresh_background_action_buttons()
         if self.retrain_log_handle is not None:
             self.retrain_log_handle.close()
             self.retrain_log_handle = None
@@ -1902,6 +3296,7 @@ class VideoOverlayPlayer(QMainWindow):
             )
         
         self.retrain_process = None
+        self.refresh_background_action_buttons()
     
     def try_autoload_dlc(self, video_path: str):
         """Try to automatically load DLC file from predictions folder"""
@@ -1947,16 +3342,68 @@ class VideoOverlayPlayer(QMainWindow):
             
     def load_files(self):
         """Load video and DLC files"""
-        video_path = self.video_input.text()
-        dlc_path = self.dlc_input.text()
+        video_path = self.video_input.text().strip()
+        dlc_path = self.dlc_input.text().strip()
+        has_pending_local_edits = (
+            self.save_timer.isActive()
+            or self._pending_save
+            or bool(self.pending_export_frames)
+        )
+        current_file_changed = self.dlc_changed_on_disk()
+        target_matches_current = self._same_path(dlc_path, self.dlc_path)
+
+        if self._calibration_in_progress:
+            self.set_edit_status(
+                "Calibration in progress. Wait for it to finish before loading new files.",
+                is_error=True,
+            )
+            return
+
+        if self._save_in_progress:
+            self._load_after_save = True
+            self._load_after_save_paths = (video_path, dlc_path)
+            self.set_edit_status(
+                "Save/export in progress. Requested files will load when it finishes.",
+                is_error=False,
+            )
+            return
+
+        if current_file_changed and has_pending_local_edits:
+            confirmed = self.confirm_discard_unsaved_reload(
+                "The DLC file changed on disk after this window loaded it.\n\n"
+                "Reloading now will discard the current unsaved in-memory edits from this window."
+            )
+            if not confirmed:
+                self.set_edit_status("Reload canceled. Current in-memory edits were kept.", is_error=True)
+                return
+            self.clear_pending_save_state()
+            self.set_edit_status("Discarded stale in-memory edits and reloading from disk.", is_error=False)
+        elif has_pending_local_edits:
+            self.queue_load_after_save(
+                video_path,
+                dlc_path,
+                "Saving current edits before loading requested files...",
+            )
+            return
+        elif current_file_changed and target_matches_current:
+            self.set_edit_status("Reloading newer DLC file from disk.", is_error=False)
         
         # Reset editing session state for new files
         self.dragging_point_name = None
         self.dragging_dlc_row_idx = None
         self.drag_start_frame = None
+        self.drag_start_frame_pos = None
+        self.drag_all_points = False
+        self.drag_source_points_raw = {}
         self.drag_preview_raw = None
+        self.drag_preview_points_raw = {}
+        self.drag_rotate_points = False
+        self.drag_rotation_center_point = None
+        self.drag_rotation_center_px = None
+        self.drag_rotation_start_angle = None
         self.editable_point_names = set()
         self.pending_export_frames = {}
+        self.pending_export_frame_revisions = {}
         self.export_root = None
         self.export_frames_dir = None
         self.export_labels_dir = None
@@ -1965,9 +3412,20 @@ class VideoOverlayPlayer(QMainWindow):
         self._last_rendered_rgb_base = None
         self._pending_save = False
         self._dlc_backup_created = False
+        self._edit_revision = 0
+        self._save_followup_requested = False
+        self._save_followup_export = False
+        self._close_after_save = False
+        self._retrain_after_save = False
+        self._calibration_after_save = False
+        self._close_after_calibration = False
+        self._load_after_save = False
+        self._load_after_save_paths = None
+        self._loaded_dlc_signature = None
         self.coords_are_normalized = False
         if hasattr(self, "_coords_checked"):
             delattr(self, "_coords_checked")
+        self.refresh_flip_ears_button()
         if self.save_timer.isActive():
             self.save_timer.stop()
         if self.edit_mode_btn.isChecked():
@@ -2105,6 +3563,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.frame_info_label.setText("Loading: Rendering first frame...")
         QApplication.processEvents()  # Update UI
         self.display_frame()
+        self.remember_loaded_dlc_signature(self.dlc_path)
         print(f"=== Load complete ===\n")
         
     def parse_dlc_points(self):
@@ -2155,6 +3614,10 @@ class VideoOverlayPlayer(QMainWindow):
             self.points_layout.addWidget(no_points_label)
             self.refresh_clear_point_combo([])
             return
+
+        created_conf_cols = self.ensure_confidence_columns(point_names)
+        if created_conf_cols > 0:
+            print(f"Created {created_conf_cols} missing *_conf columns for editable points.")
         
         # Drop stale point configs from previous files and keep only current points.
         existing_configs = self.point_configs.copy()
@@ -2332,29 +3795,11 @@ class VideoOverlayPlayer(QMainWindow):
                         x = row[x_col]
                         y = row[y_col]
                         
-                        # Get confidence/probability score - try multiple naming patterns
-                        confidence = None
-                        # Try exact match first
-                        for suffix in ['_prob', '_likelihood', '_conf']:
-                            conf_col = f"{point_name}{suffix}"
-                            if conf_col in self.dlc_data.columns:
-                                confidence = row[conf_col]
-                                break
-                        
-                        # If not found and point name ends with _cam, try without _cam suffix
-                        if confidence is None and point_name.endswith('_cam'):
-                            base_name = point_name[:-4]  # Remove '_cam'
-                            for suffix in ['_prob', '_likelihood', '_conf']:
-                                conf_col = f"{base_name}{suffix}"
-                                if conf_col in self.dlc_data.columns:
-                                    confidence = row[conf_col]
-                                    break
-                        
                         if pd.notna(x) and pd.notna(y):
                             try:
                                 x_raw = float(x)
                                 y_raw = float(y)
-                                conf_value = float(confidence) if pd.notna(confidence) else None
+                                conf_value = self.get_point_confidence_value_from_data(row, point_name)
                                 
                                 # Auto-detect if coordinates are normalized (0-1 range)
                                 if not hasattr(self, '_coords_checked'):
@@ -2844,6 +4289,22 @@ class VideoOverlayPlayer(QMainWindow):
         """Clean up on close"""
         if self.save_timer.isActive():
             self.save_timer.stop()
+        if self._calibration_in_progress:
+            self._close_after_calibration = True
+            self.set_calibration_status("Calibration in progress. Window will close when it finishes.")
+            event.ignore()
+            return
+        if self._save_in_progress:
+            self._close_after_save = True
+            self.set_edit_status("Save/export in progress. Window will close when it finishes.")
+            event.ignore()
+            return
+        if self._pending_save or self.pending_export_frames:
+            self._close_after_save = True
+            self.persist_dlc_edits(export_frames=True, autosave=False)
+            self.set_edit_status("Saving pending edits before closing...")
+            event.ignore()
+            return
         if self.retrain_poll_timer.isActive():
             self.retrain_poll_timer.stop()
         if self.retrain_process is not None and self.retrain_process.poll() is None:
@@ -2851,8 +4312,6 @@ class VideoOverlayPlayer(QMainWindow):
                 self.retrain_process.terminate()
             except Exception:
                 pass
-        if self._pending_save:
-            self.persist_dlc_edits()
         self.save_preferences()
         if self.retrain_log_handle is not None:
             self.retrain_log_handle.close()
