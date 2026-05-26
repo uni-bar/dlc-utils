@@ -1,0 +1,7 @@
+# video_path=/Volumes/Data/Bareket/experiments/reptilearn4/PV82/20260308/block3/videos/top_20260308T100054.mp4
+# dlc_path=/Volumes/Data/Bareket/experiments/reptilearn4/PV82/20260308/block3/videos/predictions/front_head_only_resnet_152_retrained__top_20260308T100054.parquet
+# frame=725
+# dlc_row=725
+# edited_point=APPLY_NEXT10
+# timestamp=2026-04-23T10:07:25.434594Z
+point_name,x_raw,y_raw,x_pixel,y_pixel,x_norm,y_norm,confidence

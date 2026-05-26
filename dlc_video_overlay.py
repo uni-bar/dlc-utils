@@ -1603,8 +1603,41 @@ class VideoOverlayPlayer(QMainWindow):
         base_name = f"{video_prefix}_f{frame_num:07d}"
         img_path = self.export_frames_dir / f"{base_name}.png"
         label_path = self.export_labels_dir / f"{base_name}.txt"
-        
-        cv2.imwrite(str(img_path), frame_bgr)
+
+        # Write via temp file + verify to avoid leaving truncated/corrupt PNGs on flaky mounts.
+        tmp_img_path = self.export_frames_dir / f"{base_name}.tmp.png"
+        ok = cv2.imwrite(str(tmp_img_path), frame_bgr)
+        if not ok or not tmp_img_path.exists():
+            self.set_edit_status(f"Failed saving frame image: {tmp_img_path}", is_error=True)
+            return
+
+        # Verify the saved file can be decoded (cv2.imread returns None on truncated PNG).
+        try:
+            if cv2.imread(str(tmp_img_path), cv2.IMREAD_UNCHANGED) is None:
+                tmp_img_path.unlink(missing_ok=True)
+                self.set_edit_status(
+                    f"Saved image is unreadable/corrupt (likely truncated write): {tmp_img_path}. "
+                    "Try exporting to a local folder (/scratch200/...) and then copying.",
+                    is_error=True,
+                )
+                return
+        except Exception:
+            try:
+                tmp_img_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.set_edit_status(f"Failed verifying exported image: {tmp_img_path}", is_error=True)
+            return
+
+        try:
+            tmp_img_path.replace(img_path)
+        except Exception as exc:
+            try:
+                tmp_img_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.set_edit_status(f"Failed finalizing exported image: {exc}", is_error=True)
+            return
         
         row = self.dlc_data.iloc[dlc_row_idx]
         lines = [

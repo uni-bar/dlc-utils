@@ -1,0 +1,21 @@
+[INFO] Loading HPC modules: CUDA/CUDA-11.8 cudnn/cudnn-8.3.2.4
+[INFO] Auto-selected GPU: 0
+[INFO] labels-root:      /a/home/cc/students/neurosci/bareketd1/sandbox/dlc-utils/manual_labels
+[INFO] source project:   /scratch200/bareketd1/tmp/dlc_retrain/front_head_only
+[INFO] work project:     /scratch200/bareketd1/tmp/dlc_retrain/front_head_only_20260420_123928
+[INFO] source config:    /scratch200/bareketd1/tmp/dlc_retrain/front_head_only/config.yaml
+[INFO] work config:      /scratch200/bareketd1/tmp/dlc_retrain/front_head_only_20260420_123928/config_hpc_retrain.yaml
+[INFO] output model dir: /a/home/cc/students/neurosci/bareketd1/data/rep5/output/models/deeplabcut/top_head_resnet_152_retrained_5
+[INFO] iters/shuffle:    5000 / 2
+[INFO] net/augmenter:    resnet_152 / imgaug
+[INFO] prune/skip-bad:   1 / 1 / 1
+[INFO] base model dir:   /a/home/cc/students/neurosci/bareketd1/data/rep4/output/models/deeplabcut/front_top_head_resnet_152_retrained
+[INFO] python:           /scratch200/bareketd1/PreyTouch/bin/python
+[INFO] TF log level:     2
+[INFO] import timeout:   45s
+[INFO] smoke timeout:    90s
+[INFO] posecfg template: /scratch200/bareketd1/tmp/dlc_retrain/front_head_only/dlc-models/iteration-2/front_head_onlyJan23-trainset95shuffle2/train/pose_cfg.yaml
+[INFO] manual labels (any source): 1457 txt, 854 images
+[INFO] Checking Python/DLC availability...
+2026-04-20 12:39:44.634102: E tensorflow/stream_executor/cuda/cuda_blas.cc:2981] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+[FATAL] DeepLabCut/TensorFlow import timed out after 45s in /scratch200/bareketd1/PreyTouch/bin/python. This node/env is not healthy right now; rerun on a different node or retry later.

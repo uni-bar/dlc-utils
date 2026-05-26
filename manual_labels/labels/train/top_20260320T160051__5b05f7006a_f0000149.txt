@@ -1,0 +1,11 @@
+# video_path=/Volumes/Data/Bareket/experiments/reptilearn4/PV82/20260320/block9/videos/top_20260320T160051.mp4
+# dlc_path=/Volumes/Data/Bareket/experiments/reptilearn4/PV82/20260320/block9/videos/predictions/front_top_head_resnet_152_retrained__top_20260320T160051.parquet
+# frame=149
+# dlc_row=149
+# edited_point=left_ear_cam|right_ear_cam
+# timestamp=2026-04-24T10:06:38.661945Z
+point_name,x_raw,y_raw,x_pixel,y_pixel,x_norm,y_norm,confidence
+left_ear_cam,1159.749268,845.858704,1159,845,0.805381,0.783203,1.000000
+mid_ears_cam,1168.058105,812.981812,1168,812,0.811151,0.752761,0.889186
+nose_cam,1228.270386,822.843201,1228,822,0.852966,0.761892,0.988796
+right_ear_cam,1176.366821,780.104980,1176,780,0.816921,0.722319,1.000000
