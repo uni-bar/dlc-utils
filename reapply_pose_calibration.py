@@ -21,7 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-DEFAULT_CALIBRATION_DIR = Path("/Volumes/Data/Bareket/arenas_configs/zeology low/calibrations")
+DEFAULT_CALIBRATION_DIR = Path("/media/sil3/Data/Bareket/arena_configs/reptilearn5/calibrations")
 
 
 def log(message: str):
@@ -31,7 +31,7 @@ def log(message: str):
 def guess_default_arena_dir() -> Path:
     here = Path(__file__).resolve()
     candidates = [
-        Path.home() / "Dev" / "PreyTouch" / "Arena",
+        Path.home()  / "PreyTouch" / "Arena",
         here.parents[2] / "Arena",
         here.parent / "Arena",
     ]

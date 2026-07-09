@@ -34,6 +34,23 @@ DEFAULT_APP_CALIBRATION_DIR = None
 run_edited_pose_calibration_job = None
 CALIBRATION_HELPER_IMPORT_ERROR = None
 
+CALIBRATION_PRESETS = {
+    "reptilearn5": {
+        "label": "Reptilearn 5 defaults",
+        "calibration_dir": "/media/sil3/Data/Bareket/arena_configs/reptilearn5/calibrations",
+        "screen_start_x": "7.59",
+        "screen_pix_cm": "0.027604",
+        "screen_y": "-4.3",
+    },
+    "reptilearn4": {
+        "label": "Reptilearn 4 defaults",
+        "calibration_dir": "/media/sil3/Data/Bareket/arenas_configs/reptilearn4/calibrations",
+        "screen_start_x": "5.59",
+        "screen_pix_cm": "0.027604",
+        "screen_y": "0.06",
+    },
+}
+
 
 def load_calibration_helper():
     """Load calibration helper only when the user actually runs calibration."""
@@ -806,11 +823,21 @@ class VideoOverlayPlayer(QMainWindow):
         model_path_row.addWidget(model_path_browse)
         retrain_layout.addLayout(model_path_row)
 
+        calibration_preset_row = QHBoxLayout()
+        self.calibration_preset_combo = QComboBox()
+        self.calibration_preset_combo.addItem("Custom/manual", "")
+        for preset_key, preset in CALIBRATION_PRESETS.items():
+            self.calibration_preset_combo.addItem(preset["label"], preset_key)
+        self.calibration_preset_combo.currentIndexChanged.connect(self.on_calibration_preset_changed)
+        calibration_preset_row.addWidget(QLabel("Preset:"))
+        calibration_preset_row.addWidget(self.calibration_preset_combo)
+        retrain_layout.addLayout(calibration_preset_row)
+
         calibration_dir_row = QHBoxLayout()
         default_calibration_text = str(self.default_calibration_dir) if self.default_calibration_dir is not None else ""
         self.calibration_dir_input = QLineEdit(default_calibration_text)
         self.calibration_dir_input.setPlaceholderText("Calibration folder")
-        self.calibration_dir_input.editingFinished.connect(self.save_preferences)
+        self.calibration_dir_input.editingFinished.connect(self.on_calibration_field_edited)
         calibration_dir_browse = QPushButton("Browse")
         calibration_dir_browse.clicked.connect(self.browse_calibration_dir)
         calibration_dir_row.addWidget(self.calibration_dir_input)
@@ -821,15 +848,15 @@ class VideoOverlayPlayer(QMainWindow):
         self.screen_start_x_input = QLineEdit("7.59")
         self.screen_start_x_input.setMaximumWidth(80)
         self.screen_start_x_input.setPlaceholderText("start_x")
-        self.screen_start_x_input.editingFinished.connect(self.save_preferences)
+        self.screen_start_x_input.editingFinished.connect(self.on_calibration_field_edited)
         self.screen_pix_cm_input = QLineEdit("0.027604")
         self.screen_pix_cm_input.setMaximumWidth(90)
         self.screen_pix_cm_input.setPlaceholderText("pix_cm")
-        self.screen_pix_cm_input.editingFinished.connect(self.save_preferences)
+        self.screen_pix_cm_input.editingFinished.connect(self.on_calibration_field_edited)
         self.screen_y_input = QLineEdit("-4.3")
         self.screen_y_input.setMaximumWidth(80)
         self.screen_y_input.setPlaceholderText("screen_y")
-        self.screen_y_input.editingFinished.connect(self.save_preferences)
+        self.screen_y_input.editingFinished.connect(self.on_calibration_field_edited)
         screen_calibration_row.addWidget(QLabel("Screen:"))
         screen_calibration_row.addWidget(self.screen_start_x_input)
         screen_calibration_row.addWidget(self.screen_pix_cm_input)
@@ -1121,6 +1148,7 @@ class VideoOverlayPlayer(QMainWindow):
         )
         if folder_path:
             self.calibration_dir_input.setText(folder_path)
+            self.calibration_preset_combo.setCurrentIndex(0)
             self.save_preferences()
 
     def browse_manual_labels_root(self):
@@ -3121,6 +3149,28 @@ class VideoOverlayPlayer(QMainWindow):
         self.calibration_status_label.setStyleSheet(f"font-size: 8.5pt; color: {color};")
         self.calibration_status_label.setText(message)
 
+    def on_calibration_preset_changed(self):
+        """Apply hard-coded calibration defaults selected in the UI."""
+        preset_key = self.calibration_preset_combo.currentData()
+        if not preset_key:
+            self.save_preferences()
+            return
+        preset = CALIBRATION_PRESETS.get(str(preset_key))
+        if not preset:
+            return
+        self.calibration_dir_input.setText(preset["calibration_dir"])
+        self.screen_start_x_input.setText(preset["screen_start_x"])
+        self.screen_pix_cm_input.setText(preset["screen_pix_cm"])
+        self.screen_y_input.setText(preset["screen_y"])
+        self.save_preferences()
+
+    def on_calibration_field_edited(self):
+        """Manual edits mean the calibration fields no longer exactly represent a preset."""
+        if self.calibration_preset_combo.currentData():
+            self.calibration_preset_combo.setCurrentIndex(0)
+        else:
+            self.save_preferences()
+
     def get_configured_calibration_dir(self) -> Optional[Path]:
         """Return the selected calibration directory, falling back to the app default."""
         text = self.calibration_dir_input.text().strip()
@@ -4219,6 +4269,7 @@ class VideoOverlayPlayer(QMainWindow):
                     retrain_model_name = prefs.get('retrain_model_name', '')
                     retrain_cam_name = prefs.get('retrain_cam_name', 'top')
                     retrain_iterations = prefs.get('retrain_iterations', 5000)
+                    calibration_preset = prefs.get('calibration_preset', '')
                     calibration_dir = prefs.get('calibration_dir', '')
                     screen_start_x = prefs.get('screen_start_x', '')
                     screen_pix_cm = prefs.get('screen_pix_cm', '')
@@ -4249,6 +4300,10 @@ class VideoOverlayPlayer(QMainWindow):
                         self.screen_pix_cm_input.setText(str(screen_pix_cm))
                     if screen_y != '':
                         self.screen_y_input.setText(str(screen_y))
+                    if calibration_preset:
+                        idx = self.calibration_preset_combo.findData(calibration_preset)
+                        if idx >= 0:
+                            self.calibration_preset_combo.setCurrentIndex(idx)
                     self.retrain_iters_spin.setValue(
                         max(self.retrain_iters_spin.minimum(), min(self.retrain_iters_spin.maximum(), int(retrain_iterations)))
                     )
@@ -4294,6 +4349,7 @@ class VideoOverlayPlayer(QMainWindow):
                 'retrain_model_name': self.retrain_model_name_input.text().strip(),
                 'retrain_cam_name': self.retrain_cam_name_input.text().strip(),
                 'retrain_iterations': int(self.retrain_iters_spin.value()),
+                'calibration_preset': self.calibration_preset_combo.currentData() or '',
                 'calibration_dir': self.calibration_dir_input.text().strip(),
                 'screen_start_x': self.screen_start_x_input.text().strip(),
                 'screen_pix_cm': self.screen_pix_cm_input.text().strip(),
