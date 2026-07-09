@@ -6,6 +6,7 @@ A lightweight video player with DeepLabCut point overlay capabilities
 
 import sys
 import csv
+import importlib
 import json
 import math
 import random
@@ -29,16 +30,28 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, QUrl
 from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QPen, QDesktopServices
 
-try:
-    from run_edited_pose_calibration import (
-        DEFAULT_APP_CALIBRATION_DIR,
-        run_edited_pose_calibration_job,
-    )
-    CALIBRATION_HELPER_IMPORT_ERROR = None
-except Exception as exc:
-    DEFAULT_APP_CALIBRATION_DIR = None
-    run_edited_pose_calibration_job = None
-    CALIBRATION_HELPER_IMPORT_ERROR = str(exc)
+DEFAULT_APP_CALIBRATION_DIR = None
+run_edited_pose_calibration_job = None
+CALIBRATION_HELPER_IMPORT_ERROR = None
+
+
+def load_calibration_helper():
+    """Load calibration helper only when the user actually runs calibration."""
+    global DEFAULT_APP_CALIBRATION_DIR, run_edited_pose_calibration_job, CALIBRATION_HELPER_IMPORT_ERROR
+
+    if run_edited_pose_calibration_job is not None:
+        return run_edited_pose_calibration_job
+
+    try:
+        module = importlib.import_module("run_edited_pose_calibration")
+        run_edited_pose_calibration_job = module.run_edited_pose_calibration_job
+        DEFAULT_APP_CALIBRATION_DIR = getattr(module, "DEFAULT_APP_CALIBRATION_DIR", None)
+        CALIBRATION_HELPER_IMPORT_ERROR = None
+        return run_edited_pose_calibration_job
+    except (Exception, SystemExit) as exc:
+        run_edited_pose_calibration_job = None
+        CALIBRATION_HELPER_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        return None
 
 
 class InteractiveVideoLabel(QLabel):
@@ -365,7 +378,7 @@ class SaveExportWorker(QObject):
         created_backup = False
 
         if job["create_backup"] and dlc_file.exists() and not backup_file.exists():
-            shutil.copy2(dlc_file, backup_file)
+            shutil.copyfile(dlc_file, backup_file)
             created_backup = True
 
         if is_parquet:
@@ -445,17 +458,21 @@ class CalibrationWorker(QObject):
 
     def run(self):
         try:
-            if run_edited_pose_calibration_job is None:
+            helper = load_calibration_helper()
+            if helper is None:
                 raise RuntimeError(
                     "Calibration helper could not be imported"
                     + (f": {CALIBRATION_HELPER_IMPORT_ERROR}" if CALIBRATION_HELPER_IMPORT_ERROR else "")
                 )
 
             log_lines: List[str] = []
-            result = run_edited_pose_calibration_job(
+            result = helper(
                 pose_file=self.job["pose_file"],
                 video_path=self.job["video_path"],
                 calibration_dir=self.job["calibration_dir"],
+                screen_start_x=self.job.get("screen_start_x"),
+                screen_pix_cm=self.job.get("screen_pix_cm"),
+                screen_y=self.job.get("screen_y"),
                 logger=lambda message: log_lines.append(str(message)),
             )
             result["log_lines"] = log_lines
@@ -788,6 +805,36 @@ class VideoOverlayPlayer(QMainWindow):
         model_path_row.addWidget(self.retrain_model_path_input)
         model_path_row.addWidget(model_path_browse)
         retrain_layout.addLayout(model_path_row)
+
+        calibration_dir_row = QHBoxLayout()
+        default_calibration_text = str(self.default_calibration_dir) if self.default_calibration_dir is not None else ""
+        self.calibration_dir_input = QLineEdit(default_calibration_text)
+        self.calibration_dir_input.setPlaceholderText("Calibration folder")
+        self.calibration_dir_input.editingFinished.connect(self.save_preferences)
+        calibration_dir_browse = QPushButton("Browse")
+        calibration_dir_browse.clicked.connect(self.browse_calibration_dir)
+        calibration_dir_row.addWidget(self.calibration_dir_input)
+        calibration_dir_row.addWidget(calibration_dir_browse)
+        retrain_layout.addLayout(calibration_dir_row)
+
+        screen_calibration_row = QHBoxLayout()
+        self.screen_start_x_input = QLineEdit("7.59")
+        self.screen_start_x_input.setMaximumWidth(80)
+        self.screen_start_x_input.setPlaceholderText("start_x")
+        self.screen_start_x_input.editingFinished.connect(self.save_preferences)
+        self.screen_pix_cm_input = QLineEdit("0.027604")
+        self.screen_pix_cm_input.setMaximumWidth(90)
+        self.screen_pix_cm_input.setPlaceholderText("pix_cm")
+        self.screen_pix_cm_input.editingFinished.connect(self.save_preferences)
+        self.screen_y_input = QLineEdit("-4.3")
+        self.screen_y_input.setMaximumWidth(80)
+        self.screen_y_input.setPlaceholderText("screen_y")
+        self.screen_y_input.editingFinished.connect(self.save_preferences)
+        screen_calibration_row.addWidget(QLabel("Screen:"))
+        screen_calibration_row.addWidget(self.screen_start_x_input)
+        screen_calibration_row.addWidget(self.screen_pix_cm_input)
+        screen_calibration_row.addWidget(self.screen_y_input)
+        retrain_layout.addLayout(screen_calibration_row)
         
         retrain_args_row = QHBoxLayout()
         self.retrain_model_name_input = QLineEdit()
@@ -807,10 +854,9 @@ class VideoOverlayPlayer(QMainWindow):
 
         self.reapply_calibration_btn = QPushButton("Reapply Calibration To Edited DLC")
         self.reapply_calibration_btn.clicked.connect(self.start_reapply_calibration)
-        if self.default_calibration_dir is not None:
-            self.reapply_calibration_btn.setToolTip(
-                f"Uses the current DLC file, current video, and calibration dir {self.default_calibration_dir}"
-            )
+        self.reapply_calibration_btn.setToolTip(
+            "Uses the current DLC file, current video, and the selected calibration folder."
+        )
         retrain_layout.addWidget(self.reapply_calibration_btn)
 
         self.calibration_status_label = QLabel("Calibration status: idle")
@@ -894,19 +940,19 @@ class VideoOverlayPlayer(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_video)
         controls_layout.addWidget(self.stop_btn)
         
-        skip_back_btn = QPushButton("◄◄ -10")
+        skip_back_btn = QPushButton("???? -10")
         skip_back_btn.clicked.connect(lambda: self.skip_frames(-10))
         controls_layout.addWidget(skip_back_btn)
         
-        prev_frame_btn = QPushButton("◄ -1")
+        prev_frame_btn = QPushButton("?? -1")
         prev_frame_btn.clicked.connect(lambda: self.skip_frames(-1))
         controls_layout.addWidget(prev_frame_btn)
         
-        next_frame_btn = QPushButton("1 ►")
+        next_frame_btn = QPushButton("1 ??")
         next_frame_btn.clicked.connect(lambda: self.skip_frames(1))
         controls_layout.addWidget(next_frame_btn)
         
-        skip_forward_btn = QPushButton("+10 ►►")
+        skip_forward_btn = QPushButton("+10 ????")
         skip_forward_btn.clicked.connect(lambda: self.skip_frames(10))
         controls_layout.addWidget(skip_forward_btn)
         
@@ -1055,6 +1101,26 @@ class VideoOverlayPlayer(QMainWindow):
         )
         if folder_path:
             self.retrain_model_path_input.setText(folder_path)
+            self.save_preferences()
+
+    def browse_calibration_dir(self):
+        """Select calibration folder used when recalibrating edited DLC files."""
+        start_dir = str(Path.home())
+        current_text = self.calibration_dir_input.text().strip()
+        if current_text:
+            current_path = Path(current_text).expanduser()
+            if current_path.exists():
+                start_dir = str(current_path if current_path.is_dir() else current_path.parent)
+            elif current_path.parent.exists():
+                start_dir = str(current_path.parent)
+
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select calibration folder",
+            start_dir
+        )
+        if folder_path:
+            self.calibration_dir_input.setText(folder_path)
             self.save_preferences()
 
     def browse_manual_labels_root(self):
@@ -3055,16 +3121,32 @@ class VideoOverlayPlayer(QMainWindow):
         self.calibration_status_label.setStyleSheet(f"font-size: 8.5pt; color: {color};")
         self.calibration_status_label.setText(message)
 
+    def get_configured_calibration_dir(self) -> Optional[Path]:
+        """Return the selected calibration directory, falling back to the app default."""
+        text = self.calibration_dir_input.text().strip()
+        if text:
+            return Path(text).expanduser()
+        return self.default_calibration_dir
+
+    def get_configured_screen_calibration(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Return screen calibration values used by run_model for bug cm/deviation columns."""
+        values = []
+        for field in (self.screen_start_x_input, self.screen_pix_cm_input, self.screen_y_input):
+            text = field.text().strip()
+            values.append(float(text) if text else None)
+        return values[0], values[1], values[2]
+
     def build_calibration_job(self) -> Dict[str, Any]:
         """Capture the current DLC/video context for recalibration."""
-        calibration_dir = (
-            str(self.default_calibration_dir)
-            if self.default_calibration_dir is not None else None
-        )
+        calibration_dir = self.get_configured_calibration_dir()
+        screen_start_x, screen_pix_cm, screen_y = self.get_configured_screen_calibration()
         return {
             "pose_file": self.dlc_path,
             "video_path": self.video_path,
-            "calibration_dir": calibration_dir,
+            "calibration_dir": str(calibration_dir) if calibration_dir is not None else None,
+            "screen_start_x": screen_start_x,
+            "screen_pix_cm": screen_pix_cm,
+            "screen_y": screen_y,
         }
 
     def launch_calibration_worker(self, job: Dict[str, Any]):
@@ -3108,17 +3190,30 @@ class VideoOverlayPlayer(QMainWindow):
         if self.video_path is None or self.dlc_data is None or not self.dlc_path:
             self.set_calibration_status("Load video + DLC first.", is_error=True)
             return
-        if run_edited_pose_calibration_job is None:
+        if load_calibration_helper() is None:
             self.set_calibration_status(
                 f"Calibration helper unavailable: {CALIBRATION_HELPER_IMPORT_ERROR}",
                 is_error=True,
             )
             return
+        calibration_dir = self.get_configured_calibration_dir()
+        if calibration_dir is None:
+            self.set_calibration_status("Choose a calibration folder first.", is_error=True)
+            return
+        if not calibration_dir.exists():
+            self.set_calibration_status(f"Calibration folder does not exist: {calibration_dir}", is_error=True)
+            return
+        try:
+            self.get_configured_screen_calibration()
+        except ValueError:
+            self.set_calibration_status("Screen calibration values must be numbers.", is_error=True)
+            return
 
         self.set_calibration_status(
-            f"Reapplying calibration to {Path(self.dlc_path).name}...",
+            f"Reapplying calibration to {Path(self.dlc_path).name} using {calibration_dir}...",
             is_error=False,
         )
+        self.save_preferences()
         self.launch_calibration_worker(self.build_calibration_job())
 
     def on_calibration_worker_finished(self, result: Dict[str, Any]):
@@ -3127,6 +3222,11 @@ class VideoOverlayPlayer(QMainWindow):
         self.refresh_background_action_buttons()
         updated_cells = int(result.get("updated_cells", 0))
         output_path = result.get("output_path") or self.dlc_path
+        log_lines = result.get("log_lines") or []
+        if log_lines:
+            print("Calibration log:")
+            for line in log_lines:
+                print(line)
         self.set_calibration_status(
             f"Calibration finished ({updated_cells} calibrated cells).",
             is_error=False,
@@ -3149,6 +3249,8 @@ class VideoOverlayPlayer(QMainWindow):
         summary = error_text.strip().splitlines()[-1] if error_text.strip() else "Unknown calibration failure"
         self.set_calibration_status(f"Calibration failed: {summary}", is_error=True)
         self.set_edit_status("Calibration failed. See console output for details.", is_error=True)
+        print("Error recalibrating edited DLC file:")
+        print(error_text)
     
     def set_retrain_status(self, message: str, is_error: bool = False):
         """Update retrain workflow status line."""
@@ -3490,9 +3592,9 @@ class VideoOverlayPlayer(QMainWindow):
             # Check for confidence/probability columns
             conf_cols = [col for col in self.dlc_data.columns if '_prob' in col or '_likelihood' in col or '_conf' in col]
             if conf_cols:
-                print(f"✓ Found confidence columns: {conf_cols[:5]}")
+                print(f"?? Found confidence columns: {conf_cols[:5]}")
             else:
-                print(f"⚠ No confidence columns found (_prob, _likelihood, or _conf)")
+                print(f"?? No confidence columns found (_prob, _likelihood, or _conf)")
             
             # Check for trial_id column (with or without trailing underscore)
             trial_id_col = None
@@ -3502,7 +3604,7 @@ class VideoOverlayPlayer(QMainWindow):
                 trial_id_col = 'trial_id_'
             
             if trial_id_col:
-                print(f"✓ trial_id column found ({trial_id_col}) - will display in frame info")
+                print(f"?? trial_id column found ({trial_id_col}) - will display in frame info")
                 self._trial_id_col = trial_id_col  # Cache for faster access
                 self._current_trial_id = None  # Initialize to None
             else:
@@ -4117,6 +4219,10 @@ class VideoOverlayPlayer(QMainWindow):
                     retrain_model_name = prefs.get('retrain_model_name', '')
                     retrain_cam_name = prefs.get('retrain_cam_name', 'top')
                     retrain_iterations = prefs.get('retrain_iterations', 5000)
+                    calibration_dir = prefs.get('calibration_dir', '')
+                    screen_start_x = prefs.get('screen_start_x', '')
+                    screen_pix_cm = prefs.get('screen_pix_cm', '')
+                    screen_y = prefs.get('screen_y', '')
                     
                     if retrain_config and Path(retrain_config).exists():
                         self.retrain_config_input.setText(retrain_config)
@@ -4135,6 +4241,14 @@ class VideoOverlayPlayer(QMainWindow):
                         self.retrain_model_name_input.setText(retrain_model_name)
                     if retrain_cam_name:
                         self.retrain_cam_name_input.setText(retrain_cam_name)
+                    if calibration_dir:
+                        self.calibration_dir_input.setText(calibration_dir)
+                    if screen_start_x != '':
+                        self.screen_start_x_input.setText(str(screen_start_x))
+                    if screen_pix_cm != '':
+                        self.screen_pix_cm_input.setText(str(screen_pix_cm))
+                    if screen_y != '':
+                        self.screen_y_input.setText(str(screen_y))
                     self.retrain_iters_spin.setValue(
                         max(self.retrain_iters_spin.minimum(), min(self.retrain_iters_spin.maximum(), int(retrain_iterations)))
                     )
@@ -4148,6 +4262,8 @@ class VideoOverlayPlayer(QMainWindow):
             self.retrain_model_path_input.setText(str(self.default_model_root))
         if not self.manual_labels_root_input.text().strip():
             self.manual_labels_root_input.setText(str(self.default_manual_labels_root))
+        if not self.calibration_dir_input.text().strip() and self.default_calibration_dir is not None:
+            self.calibration_dir_input.setText(str(self.default_calibration_dir))
                 
     def save_preferences(self):
         """Save current preferences"""
@@ -4178,6 +4294,10 @@ class VideoOverlayPlayer(QMainWindow):
                 'retrain_model_name': self.retrain_model_name_input.text().strip(),
                 'retrain_cam_name': self.retrain_cam_name_input.text().strip(),
                 'retrain_iterations': int(self.retrain_iters_spin.value()),
+                'calibration_dir': self.calibration_dir_input.text().strip(),
+                'screen_start_x': self.screen_start_x_input.text().strip(),
+                'screen_pix_cm': self.screen_pix_cm_input.text().strip(),
+                'screen_y': self.screen_y_input.text().strip(),
             }
             with open(self.prefs_file, 'w') as f:
                 json.dump(prefs, f, indent=2)
