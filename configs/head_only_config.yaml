@@ -1,0 +1,19 @@
+Task: head_only
+scorer: msi
+date: 20260619
+project_path: ""
+
+bodyparts:
+  - nose
+  - left_ear
+  - right_ear
+
+TrainingFraction:
+  - 0.95
+
+iteration: 0
+default_net_type: resnet_152
+snapshotindex: -1
+batch_size: 1
+
+video_sets: {}
