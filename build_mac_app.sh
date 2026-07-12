@@ -17,6 +17,8 @@ pyinstaller --clean \
     --onefile \
     --icon=app_icon.icns \
     --add-data "README.md:." \
+    --add-data "retrain_dlc_from_manual_labels.py:." \
+    --add-data "configs/head_only_config.yaml:configs" \
     --hidden-import=PyQt5 \
     --hidden-import=cv2 \
     --hidden-import=pandas \

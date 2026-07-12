@@ -63,22 +63,28 @@ In the app UI, these are shown explicitly:
 - `DLC file overwritten on save: ...`
 - `Export folder: ...`
 
-## One-Click Retrain + Re-Run (Experimental)
+## Fine-Tune and Run Predictions
 
 After exporting corrected labels:
-1. In `Retrain + Re-Run (Experimental)`, choose DeepLabCut `config.yaml`.
-2. (Optional) Choose PreyTouch `Arena/run_model.py`.
-3. Fill PreyTouch model name (the key inside `Arena/configurations/predict_config.json`).
-4. Set camera name and lightweight iterations (for fast fine-tuning).
-5. Click `Retrain + Re-run This Video`.
+1. Choose the DeepLabCut `config.yaml` (`configs/head_only_config.yaml` is the default).
+2. Choose the trained source model that generated the original parquet.
+3. Choose an empty output folder for the retrained model.
+4. Set the number of iterations and click `Retrain`.
 
 What this workflow does:
 - Converts your exported manual labels into DLC `labeled-data/.../CollectedData_<scorer>.csv/.h5`
+- Verifies that the source folder contains trained snapshot weights
+- Forces the generated DLC training config to initialize from that snapshot
 - Runs `deeplabcut.create_training_dataset` + `deeplabcut.train_network`
-- Exports latest model
-- If `run_model.py` + model name are provided:
-  - updates `Arena/configurations/predict_config.json` model path to the newly exported model
-  - runs prediction on the currently loaded video via PreyTouch model code
+- Exports and verifies the retrained model in the selected output folder
+
+To run the model on the loaded video:
+1. Choose PreyTouch `Arena/run_model.py`.
+2. The prediction model defaults to the retrained output folder, but can be changed.
+3. Choose the calibration folder/settings and camera.
+4. Click `Run Prediction Model`.
+
+Prediction constructs `DLCArenaPose` directly from the selected model folder and runs it with the selected calibration settings on the currently loaded video. `predict_config.json` is not used or changed.
 
 Logs are written to:
 - `<video_folder>/manual_labels/<video_stem>/retrain_logs/retrain_*.log`

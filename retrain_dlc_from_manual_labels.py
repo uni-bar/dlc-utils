@@ -5,8 +5,8 @@ Retrain DeepLabCut from manual_labels exports and optionally rerun PreyTouch on 
 
 import argparse
 import csv
+import importlib
 import importlib.util
-import json
 import os
 import shutil
 import sys
@@ -46,7 +46,8 @@ def load_dlc_project_config(config_path: Path):
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
         raise RuntimeError(f"Invalid config yaml: {config_path}")
-    project_path = Path(cfg.get("project_path", config_path.parent)).expanduser().resolve()
+    project_path_text = cfg.get("project_path")
+    project_path = Path(project_path_text).expanduser().resolve() if project_path_text else config_path.parent.resolve()
     scorer = str(cfg.get("scorer", "manual"))
     bodyparts = [str(bp) for bp in cfg.get("bodyparts", [])]
     if len(bodyparts) == 0:
@@ -373,8 +374,72 @@ def find_exported_model_path(project_path: Path) -> Optional[Path]:
     return None
 
 
-def run_dlc_retrain(config_path: Path, project_path: Path, shuffle: int, iterations: int):
+def find_snapshot_prefix(model_path: Path) -> Path:
+    """Return a verified TensorFlow snapshot prefix from a trained model folder."""
+    snapshots = sorted(
+        model_path.rglob("snapshot*.index"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not snapshots:
+        raise RuntimeError(f"No trained snapshot*.index found under source model: {model_path}")
+
+    prefix = snapshots[0].with_suffix("")
+    if not list(prefix.parent.glob(prefix.name + ".data*")):
+        raise RuntimeError(f"Snapshot data file is missing for: {prefix}")
+    return prefix
+
+
+def configure_training_init_weights(project_path: Path, source_snapshot: Path):
+    """Force generated DLC training configs to initialize from the chosen snapshot."""
+    yaml = require_yaml()
+    pose_configs = sorted(
+        project_path.glob("dlc-models/iteration-*/**/train/pose_cfg.yaml"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not pose_configs:
+        raise RuntimeError(f"DeepLabCut did not create a training pose_cfg.yaml under {project_path}")
+
+    pose_config = pose_configs[0]
+    with open(pose_config, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    cfg["init_weights"] = str(source_snapshot)
+    with open(pose_config, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+
+    with open(pose_config, "r", encoding="utf-8") as f:
+        written_cfg = yaml.safe_load(f) or {}
+    if written_cfg.get("init_weights") != str(source_snapshot):
+        raise RuntimeError("Could not verify source weights in generated training config")
+    log(f"VERIFIED fine-tune initialization: {pose_config}")
+    log(f"VERIFIED source weights: {source_snapshot}")
+    return pose_config
+
+
+def copy_exported_model(model_path: Path, output_path: Path) -> Path:
+    if model_path.resolve() == output_path.resolve():
+        raise RuntimeError("Source/exported model and retrained output folder must be different")
+    if output_path.exists() and any(output_path.iterdir()):
+        raise RuntimeError(f"Retrained output folder must be empty: {output_path}")
+    output_path.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(model_path, output_path, dirs_exist_ok=True)
+    find_snapshot_prefix(output_path)
+    log(f"VERIFIED retrained model output: {output_path}")
+    return output_path
+
+
+def run_dlc_retrain(
+    config_path: Path,
+    project_path: Path,
+    source_model_path: Path,
+    output_model_path: Path,
+    shuffle: int,
+    iterations: int,
+):
     deeplabcut = require_deeplabcut()
+    source_snapshot = find_snapshot_prefix(source_model_path)
+    log(f"VERIFIED trained source model: {source_model_path}")
 
     log("Creating/rebuilding training dataset ...")
     try:
@@ -383,9 +448,8 @@ def run_dlc_retrain(config_path: Path, project_path: Path, shuffle: int, iterati
         )
     except TypeError:
         deeplabcut.create_training_dataset(str(config_path), Shuffles=[shuffle])
-    except Exception as exc:
-        log(f"Warning: create_training_dataset raised: {exc}")
-        log("Continuing with train_network (existing dataset may still be usable).")
+
+    configure_training_init_weights(project_path, source_snapshot)
 
     displayiters = max(100, min(1000, iterations // 20))
     saveiters = max(500, min(5000, iterations // 4))
@@ -414,39 +478,21 @@ def run_dlc_retrain(config_path: Path, project_path: Path, shuffle: int, iterati
         log("Warning: could not auto-detect exported model path.")
     else:
         log(f"Detected exported model path: {model_path}")
-    return model_path
+    if model_path is None:
+        raise RuntimeError("Could not find the model exported by DeepLabCut")
+    return copy_exported_model(model_path, output_model_path)
 
 
-def update_preytouch_predict_config(run_model_script: Path, model_name: str, model_path: Path):
-    arena_dir = run_model_script.expanduser().resolve().parent
-    predict_cfg_path = arena_dir / "configurations" / "predict_config.json"
-    if not predict_cfg_path.exists():
-        raise RuntimeError(f"Predict config not found: {predict_cfg_path}")
-
-    with open(predict_cfg_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    if model_name not in cfg:
-        raise RuntimeError(
-            f"Model '{model_name}' is not in {predict_cfg_path}. Add it first in PreyTouch."
-        )
-
-    backup_path = predict_cfg_path.with_suffix(".json.bak")
-    if not backup_path.exists():
-        shutil.copy2(predict_cfg_path, backup_path)
-
-    old_model_path = cfg[model_name].get("model_path")
-    cfg[model_name]["model_path"] = str(model_path)
-    with open(predict_cfg_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-    log(
-        f"Updated predict config model_path for '{model_name}': "
-        f"{old_model_path} -> {model_path}"
-    )
-    return predict_cfg_path
-
-
-def rerun_single_video(run_model_script: Path, model_name: str, cam_name: str, video_path: Path):
+def rerun_single_video(
+    run_model_script: Path,
+    model_path: Path,
+    cam_name: str,
+    video_path: Path,
+    calibration_dir: Optional[Path] = None,
+    screen_start_x: Optional[float] = None,
+    screen_pix_cm: Optional[float] = None,
+    screen_y: Optional[float] = None,
+):
     run_model_script = run_model_script.expanduser().resolve()
     if not run_model_script.exists():
         raise RuntimeError(f"run_model.py does not exist: {run_model_script}")
@@ -469,13 +515,21 @@ def rerun_single_video(run_model_script: Path, model_name: str, cam_name: str, v
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        pred_conf = module.config.load_configuration("predict")
-        if model_name not in pred_conf:
-            raise RuntimeError(f"Model '{model_name}' not found in PreyTouch predict config.")
+        module.config.CALIBRATION_DIR = str(calibration_dir) if calibration_dir else module.config.CALIBRATION_DIR
+        module.config.SCREEN_START_X_CM = screen_start_x
+        module.config.SCREEN_PIX_CM = screen_pix_cm
+        module.config.SCREEN_Y_CM = screen_y
+        module.config.IS_SCREEN_CONFIGURED_FOR_POSE = screen_start_x is not None and screen_pix_cm is not None
 
-        log(f"Running PreyTouch prediction on one video: {video_path}")
-        predictor = module.load_predictor(pred_conf, model_name, cam_name)
-        module.predict_video(predictor, str(video_path))
+        log(f"Running PreyTouch prediction on one video with model {model_path}: {video_path}")
+        pose_module = importlib.import_module("analysis.pose")
+        predictor = pose_module.DLCArenaPose(
+            cam_name,
+            model_path=str(model_path),
+            is_use_db=False,
+            is_raise_no_caliber=False,
+        )
+        predictor.predict_video(video_path=str(video_path))
         log("Prediction finished.")
     finally:
         try:
@@ -496,14 +550,20 @@ def main():
         required=True,
         help="Path to shared manual_labels root (images/train + labels/train).",
     )
-    parser.add_argument("--video-path", default=None, help="Video path used for labels and optional rerun")
+    parser.add_argument("--video-path", default=None, help="Video path used for labels or prediction")
     parser.add_argument("--dataset-name", default=None, help="Dataset folder name under DLC labeled-data")
     parser.add_argument("--shuffle", type=int, default=1, help="DLC shuffle number")
     parser.add_argument("--iterations", type=int, default=5000, help="maxiters for train_network")
+    parser.add_argument("--source-model", default=None, help="Required trained model used as initial weights")
+    parser.add_argument("--output-model", default=None, help="Destination folder for the retrained model")
+    parser.add_argument("--predict-only", action="store_true", help="Run prediction without retraining")
     parser.add_argument("--run-model-script", default=None, help="Path to PreyTouch Arena/run_model.py")
-    parser.add_argument("--model-name", default=None, help="Model key from PreyTouch predict_config.json")
     parser.add_argument("--model-path", default=None, help="Optional explicit model folder path")
     parser.add_argument("--cam-name", default="top", help="Camera name for rerun")
+    parser.add_argument("--calibration-dir", default=None)
+    parser.add_argument("--screen-start-x", type=float, default=None)
+    parser.add_argument("--screen-pix-cm", type=float, default=None)
+    parser.add_argument("--screen-y", type=float, default=None)
     args = parser.parse_args()
 
     dlc_config_path = Path(args.dlc_config).expanduser().resolve()
@@ -513,6 +573,20 @@ def main():
         Path(args.run_model_script).expanduser().resolve() if args.run_model_script else None
     )
     model_path_override = Path(args.model_path).expanduser().resolve() if args.model_path else None
+    source_model_path = Path(args.source_model).expanduser().resolve() if args.source_model else None
+    output_model_path = Path(args.output_model).expanduser().resolve() if args.output_model else None
+
+    if args.predict_only:
+        if not run_model_script or not video_path or not model_path_override:
+            raise RuntimeError("Prediction requires run-model-script, video-path, and model-path")
+        find_snapshot_prefix(model_path_override)
+        rerun_single_video(
+            run_model_script, model_path_override, args.cam_name, video_path,
+            Path(args.calibration_dir).expanduser().resolve() if args.calibration_dir else None,
+            args.screen_start_x, args.screen_pix_cm, args.screen_y,
+        )
+        log("Prediction done.")
+        return
 
     if not dlc_config_path.exists():
         raise RuntimeError(f"DLC config not found: {dlc_config_path}")
@@ -520,6 +594,10 @@ def main():
         raise RuntimeError(f"labels-root not found: {labels_root}")
     if model_path_override is not None and not model_path_override.exists():
         raise RuntimeError(f"model-path not found: {model_path_override}")
+    if source_model_path is None or not source_model_path.exists():
+        raise RuntimeError("A valid --source-model is required; retraining from scratch is not allowed")
+    if output_model_path is None:
+        raise RuntimeError("--output-model is required")
 
     flatten_stats = flatten_manual_labels_root(labels_root)
     log(f"DLC config: {dlc_config_path}")
@@ -535,7 +613,14 @@ def main():
         log(f"Video path: {video_path}")
 
     cfg, project_path, scorer, bodyparts = load_dlc_project_config(dlc_config_path)
-    dataset_name = args.dataset_name or labels_root.name
+    if not cfg.get("project_path"):
+        project_path = output_model_path.parent / f"{output_model_path.name}_dlc_project"
+        project_path.mkdir(parents=True, exist_ok=True)
+        cfg["project_path"] = str(project_path)
+        dlc_config_path = project_path / "config.yaml"
+        save_dlc_project_config(dlc_config_path, cfg)
+        log(f"Created DLC working project from template: {dlc_config_path}")
+    dataset_name = args.dataset_name or (video_path.stem if video_path else labels_root.name)
     log(f"DLC project path: {project_path}")
     log(f"Scorer: {scorer}")
     log(f"Bodyparts ({len(bodyparts)}): {bodyparts}")
@@ -558,6 +643,7 @@ def main():
     )
     log(f"Collected CSV: {prep_stats['csv_path']}")
     log(f"Collected H5: {prep_stats['h5_path']}")
+    log(f"VERIFIED new manual training samples: {prep_stats['sample_count']}")
 
     if ensure_video_in_config(cfg, video_path):
         save_dlc_project_config(dlc_config_path, cfg)
@@ -566,29 +652,13 @@ def main():
     model_path = run_dlc_retrain(
         config_path=dlc_config_path,
         project_path=project_path,
+        source_model_path=source_model_path,
+        output_model_path=output_model_path,
         shuffle=int(args.shuffle),
         iterations=int(args.iterations),
     )
 
-    if run_model_script and args.model_name and video_path:
-        effective_model_path = model_path_override if model_path_override is not None else model_path
-        if effective_model_path is not None:
-            update_preytouch_predict_config(run_model_script, args.model_name, effective_model_path)
-        else:
-            log("No exported model path detected; rerun will use current model_path in predict config.")
-        rerun_single_video(
-            run_model_script=run_model_script,
-            model_name=args.model_name,
-            cam_name=args.cam_name,
-            video_path=video_path,
-        )
-    else:
-        log(
-            "Skipping PreyTouch rerun. To enable rerun, provide --run-model-script, "
-            "--model-name, and --video-path."
-        )
-
-    log("Done.")
+    log(f"Retraining done. Retrained model: {model_path}")
 
 
 if __name__ == "__main__":

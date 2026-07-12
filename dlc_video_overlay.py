@@ -582,6 +582,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.retrain_process = None
         self.retrain_log_handle = None
         self.retrain_log_path = None
+        self._model_action = "retrain"
         self.retrain_helper_script = Path(__file__).with_name("retrain_dlc_from_manual_labels.py")
         self._calibration_in_progress = False
         self._calibration_thread = None
@@ -791,13 +792,14 @@ class VideoOverlayPlayer(QMainWindow):
         export_actions_layout.addWidget(self.open_dlc_btn)
         edit_layout.addLayout(export_actions_layout)
         
-        retrain_group = QGroupBox("Retrain + Re-Run (Experimental)")
+        retrain_group = QGroupBox("Model Retraining and Prediction")
         retrain_layout = QVBoxLayout()
         
         self.default_model_root = Path("/data/PreyTouch/output/models")
 
         retrain_cfg_row = QHBoxLayout()
-        self.retrain_config_input = QLineEdit()
+        default_retrain_config = Path(__file__).with_name("configs") / "head_only_config.yaml"
+        self.retrain_config_input = QLineEdit(str(default_retrain_config) if default_retrain_config.exists() else "")
         self.retrain_config_input.setPlaceholderText("DeepLabCut project config.yaml")
         retrain_cfg_browse = QPushButton("Browse")
         retrain_cfg_browse.clicked.connect(self.browse_retrain_config)
@@ -805,23 +807,62 @@ class VideoOverlayPlayer(QMainWindow):
         retrain_cfg_row.addWidget(retrain_cfg_browse)
         retrain_layout.addLayout(retrain_cfg_row)
         
+        source_model_row = QHBoxLayout()
+        source_model_row.addWidget(QLabel("Source trained model:"))
+        self.source_model_path_input = QLineEdit()
+        self.source_model_path_input.setPlaceholderText("Model that generated the original parquet")
+        source_model_browse = QPushButton("Browse")
+        source_model_browse.clicked.connect(self.browse_source_model_path)
+        source_model_row.addWidget(self.source_model_path_input)
+        source_model_row.addWidget(source_model_browse)
+        retrain_layout.addLayout(source_model_row)
+
+        output_model_row = QHBoxLayout()
+        output_model_row.addWidget(QLabel("Retrained model output:"))
+        self.retrained_model_path_input = QLineEdit(str(self.default_model_root / "retrained_head_only"))
+        self.retrained_model_path_input.setPlaceholderText("Destination folder for retrained model")
+        output_model_browse = QPushButton("Browse")
+        output_model_browse.clicked.connect(self.browse_retrained_model_path)
+        output_model_row.addWidget(self.retrained_model_path_input)
+        output_model_row.addWidget(output_model_browse)
+        retrain_layout.addLayout(output_model_row)
+
+        retrain_args_row = QHBoxLayout()
+        self.retrain_iters_spin = QSpinBox()
+        self.retrain_iters_spin.setRange(100, 1000000)
+        self.retrain_iters_spin.setSingleStep(500)
+        self.retrain_iters_spin.setValue(5000)
+        retrain_args_row.addWidget(QLabel("Iterations:"))
+        retrain_args_row.addWidget(self.retrain_iters_spin)
+        retrain_args_row.addStretch()
+        retrain_layout.addLayout(retrain_args_row)
+
+        self.retrain_btn = QPushButton("Retrain")
+        self.retrain_btn.clicked.connect(self.start_retrain)
+        retrain_layout.addWidget(self.retrain_btn)
+
+        self.retrain_status_label = QLabel("Retrain status: idle")
+        self.retrain_status_label.setWordWrap(True)
+        self.retrain_status_label.setStyleSheet("font-size: 8.5pt; color: #555555;")
+        retrain_layout.addWidget(self.retrain_status_label)
+
         run_model_row = QHBoxLayout()
         self.run_model_script_input = QLineEdit()
-        self.run_model_script_input.setPlaceholderText("PreyTouch Arena/run_model.py (optional for re-run)")
+        self.run_model_script_input.setPlaceholderText("PreyTouch Arena/run_model.py")
         run_model_browse = QPushButton("Browse")
         run_model_browse.clicked.connect(self.browse_run_model_script)
         run_model_row.addWidget(self.run_model_script_input)
         run_model_row.addWidget(run_model_browse)
         retrain_layout.addLayout(run_model_row)
 
-        model_path_row = QHBoxLayout()
-        self.retrain_model_path_input = QLineEdit(str(self.default_model_root))
-        self.retrain_model_path_input.setPlaceholderText("Model folder (optional)")
-        model_path_browse = QPushButton("Browse")
-        model_path_browse.clicked.connect(self.browse_retrain_model_path)
-        model_path_row.addWidget(self.retrain_model_path_input)
-        model_path_row.addWidget(model_path_browse)
-        retrain_layout.addLayout(model_path_row)
+        prediction_model_row = QHBoxLayout()
+        prediction_model_row.addWidget(QLabel("Prediction model:"))
+        self.prediction_model_path_input = QLineEdit(self.retrained_model_path_input.text())
+        prediction_model_browse = QPushButton("Browse")
+        prediction_model_browse.clicked.connect(self.browse_prediction_model_path)
+        prediction_model_row.addWidget(self.prediction_model_path_input)
+        prediction_model_row.addWidget(prediction_model_browse)
+        retrain_layout.addLayout(prediction_model_row)
 
         calibration_preset_row = QHBoxLayout()
         self.calibration_preset_combo = QComboBox()
@@ -863,21 +904,12 @@ class VideoOverlayPlayer(QMainWindow):
         screen_calibration_row.addWidget(self.screen_y_input)
         retrain_layout.addLayout(screen_calibration_row)
         
-        retrain_args_row = QHBoxLayout()
-        self.retrain_model_name_input = QLineEdit()
-        self.retrain_model_name_input.setPlaceholderText("Predict model key (optional)")
-        retrain_args_row.addWidget(self.retrain_model_name_input)
+        prediction_args_row = QHBoxLayout()
         self.retrain_cam_name_input = QLineEdit("top")
         self.retrain_cam_name_input.setMaximumWidth(80)
-        retrain_args_row.addWidget(QLabel("Cam:"))
-        retrain_args_row.addWidget(self.retrain_cam_name_input)
-        self.retrain_iters_spin = QSpinBox()
-        self.retrain_iters_spin.setRange(100, 1000000)
-        self.retrain_iters_spin.setSingleStep(500)
-        self.retrain_iters_spin.setValue(5000)
-        retrain_args_row.addWidget(QLabel("Iters:"))
-        retrain_args_row.addWidget(self.retrain_iters_spin)
-        retrain_layout.addLayout(retrain_args_row)
+        prediction_args_row.addWidget(QLabel("Cam:"))
+        prediction_args_row.addWidget(self.retrain_cam_name_input)
+        retrain_layout.addLayout(prediction_args_row)
 
         self.reapply_calibration_btn = QPushButton("Reapply Calibration To Edited DLC")
         self.reapply_calibration_btn.clicked.connect(self.start_reapply_calibration)
@@ -891,14 +923,9 @@ class VideoOverlayPlayer(QMainWindow):
         self.calibration_status_label.setStyleSheet("font-size: 8.5pt; color: #555555;")
         retrain_layout.addWidget(self.calibration_status_label)
         
-        self.retrain_btn = QPushButton("Retrain + Re-run This Video")
-        self.retrain_btn.clicked.connect(self.start_retrain_and_rerun)
-        retrain_layout.addWidget(self.retrain_btn)
-        
-        self.retrain_status_label = QLabel("Retrain status: idle")
-        self.retrain_status_label.setWordWrap(True)
-        self.retrain_status_label.setStyleSheet("font-size: 8.5pt; color: #555555;")
-        retrain_layout.addWidget(self.retrain_status_label)
+        self.run_prediction_btn = QPushButton("Run Prediction Model")
+        self.run_prediction_btn.clicked.connect(self.start_prediction)
+        retrain_layout.addWidget(self.run_prediction_btn)
         
         retrain_group.setLayout(retrain_layout)
         edit_layout.addWidget(retrain_group)
@@ -955,6 +982,20 @@ class VideoOverlayPlayer(QMainWindow):
         self.progress_slider = QSlider(Qt.Horizontal)
         self.progress_slider.valueChanged.connect(self.seek_frame)
         right_layout.addWidget(self.progress_slider)
+
+        frame_jump_layout = QHBoxLayout()
+        frame_jump_layout.addStretch()
+        frame_jump_layout.addWidget(QLabel("Frame number:"))
+        self.frame_number_spin = QSpinBox()
+        self.frame_number_spin.setRange(0, 0)
+        self.frame_number_spin.setEnabled(False)
+        self.frame_number_spin.lineEdit().returnPressed.connect(self.go_to_frame_number)
+        frame_jump_layout.addWidget(self.frame_number_spin)
+        go_to_frame_btn = QPushButton("Go")
+        go_to_frame_btn.clicked.connect(self.go_to_frame_number)
+        frame_jump_layout.addWidget(go_to_frame_btn)
+        frame_jump_layout.addStretch()
+        right_layout.addLayout(frame_jump_layout)
         
         # Playback controls
         controls_layout = QHBoxLayout()
@@ -967,19 +1008,19 @@ class VideoOverlayPlayer(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_video)
         controls_layout.addWidget(self.stop_btn)
         
-        skip_back_btn = QPushButton("???? -10")
+        skip_back_btn = QPushButton("⏪ -10")
         skip_back_btn.clicked.connect(lambda: self.skip_frames(-10))
         controls_layout.addWidget(skip_back_btn)
         
-        prev_frame_btn = QPushButton("?? -1")
+        prev_frame_btn = QPushButton("◀ -1")
         prev_frame_btn.clicked.connect(lambda: self.skip_frames(-1))
         controls_layout.addWidget(prev_frame_btn)
         
-        next_frame_btn = QPushButton("1 ??")
+        next_frame_btn = QPushButton("+1 ▶")
         next_frame_btn.clicked.connect(lambda: self.skip_frames(1))
         controls_layout.addWidget(next_frame_btn)
         
-        skip_forward_btn = QPushButton("+10 ????")
+        skip_forward_btn = QPushButton("+10 ⏩")
         skip_forward_btn.clicked.connect(lambda: self.skip_frames(10))
         controls_layout.addWidget(skip_forward_btn)
         
@@ -1106,12 +1147,12 @@ class VideoOverlayPlayer(QMainWindow):
             self.run_model_script_input.setText(file_path)
             self.save_preferences()
 
-    def browse_retrain_model_path(self):
-        """Select model folder used for optional rerun config update."""
+    def browse_model_folder(self, target_input: QLineEdit, title: str):
+        """Select a model folder and place it in the requested input."""
         default_dir = self.default_model_root.expanduser()
         start_dir = str(default_dir if default_dir.exists() else Path.home())
 
-        current_text = self.retrain_model_path_input.text().strip()
+        current_text = target_input.text().strip()
         if current_text:
             current_path = Path(current_text).expanduser()
             if current_path.exists():
@@ -1123,12 +1164,24 @@ class VideoOverlayPlayer(QMainWindow):
 
         folder_path = QFileDialog.getExistingDirectory(
             self,
-            "Select model folder",
+            title,
             start_dir
         )
         if folder_path:
-            self.retrain_model_path_input.setText(folder_path)
+            target_input.setText(folder_path)
             self.save_preferences()
+
+    def browse_source_model_path(self):
+        self.browse_model_folder(self.source_model_path_input, "Select trained source model")
+
+    def browse_retrained_model_path(self):
+        old_output = self.retrained_model_path_input.text().strip()
+        self.browse_model_folder(self.retrained_model_path_input, "Select retrained model output folder")
+        if not self.prediction_model_path_input.text().strip() or self.prediction_model_path_input.text().strip() == old_output:
+            self.prediction_model_path_input.setText(self.retrained_model_path_input.text())
+
+    def browse_prediction_model_path(self):
+        self.browse_model_folder(self.prediction_model_path_input, "Select prediction model")
 
     def browse_calibration_dir(self):
         """Select calibration folder used when recalibrating edited DLC files."""
@@ -1670,7 +1723,7 @@ class VideoOverlayPlayer(QMainWindow):
                 QTimer.singleShot(0, lambda: self.persist_dlc_edits(export_frames=True, autosave=False))
             else:
                 self._retrain_after_save = False
-                QTimer.singleShot(0, self.start_retrain_and_rerun)
+                QTimer.singleShot(0, self.start_retrain)
 
     def on_save_worker_finished(self, result: Dict[str, Any]):
         """Apply background save/export results back onto UI state."""
@@ -3140,6 +3193,8 @@ class VideoOverlayPlayer(QMainWindow):
         actions_busy = retrain_running or calibration_running
         if hasattr(self, "retrain_btn"):
             self.retrain_btn.setEnabled(not actions_busy)
+        if hasattr(self, "run_prediction_btn"):
+            self.run_prediction_btn.setEnabled(not actions_busy)
         if hasattr(self, "reapply_calibration_btn"):
             self.reapply_calibration_btn.setEnabled(not actions_busy)
 
@@ -3308,8 +3363,8 @@ class VideoOverlayPlayer(QMainWindow):
         self.retrain_status_label.setStyleSheet(f"font-size: 8.5pt; color: {color};")
         self.retrain_status_label.setText(message)
     
-    def start_retrain_and_rerun(self):
-        """Run external retrain helper script asynchronously, then optional rerun."""
+    def start_retrain(self):
+        """Fine-tune from a selected trained model using the manual label exports."""
         if self._save_in_progress or self._pending_save or self.pending_export_frames:
             self._retrain_after_save = True
             self.set_retrain_status("Saving edits and exporting labels before retrain...", is_error=False)
@@ -3336,29 +3391,32 @@ class VideoOverlayPlayer(QMainWindow):
         if not config_path.exists():
             self.set_retrain_status("Select a valid DeepLabCut config.yaml.", is_error=True)
             return
-        
-        run_model_script = self.run_model_script_input.text().strip()
-        model_name = self.retrain_model_name_input.text().strip()
-        model_path_text = self.retrain_model_path_input.text().strip()
-        cam_name = self.retrain_cam_name_input.text().strip() or "top"
-        if run_model_script and not Path(run_model_script).expanduser().exists():
-            self.set_retrain_status("run_model.py path does not exist.", is_error=True)
+
+        source_text = self.source_model_path_input.text().strip()
+        source_model = Path(source_text).expanduser() if source_text else Path()
+        source_snapshots = list(source_model.rglob("snapshot*.index")) if source_model.is_dir() else []
+        if not source_text or not source_snapshots:
+            self.set_retrain_status(
+                "Choose a trained source model containing snapshot*.index. Training from scratch is blocked.",
+                is_error=True,
+            )
             return
 
-        model_path = None
-        if model_path_text:
-            model_path_candidate = Path(model_path_text).expanduser()
-            if model_path_candidate.exists():
-                if not model_path_candidate.is_dir():
-                    self.set_retrain_status("Model folder path is not a directory.", is_error=True)
-                    return
-                model_path = model_path_candidate.resolve()
-            elif model_path_text != str(self.default_model_root):
-                self.set_retrain_status("Model folder path does not exist.", is_error=True)
-                return
-        
-        # Force a full save so both parquet/csv and manual_labels exports are up to date.
-        self.persist_dlc_edits(export_frames=True, autosave=False)
+        output_text = self.retrained_model_path_input.text().strip()
+        if not output_text:
+            self.set_retrain_status("Choose a retrained model output folder.", is_error=True)
+            return
+        output_model = Path(output_text).expanduser()
+        if output_model.resolve() == source_model.resolve():
+            self.set_retrain_status("Source and output model folders must be different.", is_error=True)
+            return
+        if output_model.exists() and not output_model.is_dir():
+            self.set_retrain_status("Retrained model output must be a folder.", is_error=True)
+            return
+        if output_model.exists() and any(output_model.iterdir()):
+            self.set_retrain_status("Retrained model output folder must be empty.", is_error=True)
+            return
+
         labels_pool_root = self.get_manual_labels_pool_root()
         if labels_pool_root is None:
             self.set_retrain_status("Manual labels folder is not initialized.", is_error=True)
@@ -3383,19 +3441,76 @@ class VideoOverlayPlayer(QMainWindow):
             "--labels-root", str(labels_pool_root),
             "--video-path", str(self.video_path),
             "--iterations", str(int(self.retrain_iters_spin.value())),
-            "--cam-name", cam_name,
+            "--source-model", str(source_model.resolve()),
+            "--output-model", str(output_model.resolve()),
         ]
-        if run_model_script:
-            cmd.extend(["--run-model-script", str(Path(run_model_script).expanduser())])
-        if model_name:
-            cmd.extend(["--model-name", model_name])
-        if model_path is not None:
-            cmd.extend(["--model-path", str(model_path)])
-        
-        log_dir = labels_pool_root / "retrain_logs"
+
+        self.prediction_model_path_input.setText(str(output_model))
+        self.save_preferences()
+        self._model_action = "retrain"
+        self.launch_model_process(cmd, labels_pool_root, "retrain")
+
+    def start_prediction(self):
+        """Run the selected prediction model on the currently loaded video."""
+        if self.retrain_process is not None and self.retrain_process.poll() is None:
+            self.set_retrain_status("A model action is already running.", is_error=True)
+            return
+        if self._calibration_in_progress:
+            self.set_retrain_status("Calibration is already running.", is_error=True)
+            return
+        if self.video_path is None:
+            self.set_retrain_status("Load the target video first.", is_error=True)
+            return
+
+        run_model_text = self.run_model_script_input.text().strip()
+        model_path_text = self.prediction_model_path_input.text().strip()
+        run_model_script = Path(run_model_text).expanduser() if run_model_text else Path()
+        model_path = Path(model_path_text).expanduser() if model_path_text else Path()
+        if not run_model_text or not run_model_script.is_file():
+            self.set_retrain_status("Select a valid PreyTouch run_model.py.", is_error=True)
+            return
+        if not model_path_text or not model_path.is_dir() or not list(model_path.rglob("snapshot*.index")):
+            self.set_retrain_status("Select a prediction model containing snapshot*.index.", is_error=True)
+            return
+        calibration_dir = self.get_configured_calibration_dir()
+        if calibration_dir is None or not calibration_dir.exists():
+            self.set_retrain_status("Choose a valid calibration folder.", is_error=True)
+            return
+        try:
+            screen_start_x, screen_pix_cm, screen_y = self.get_configured_screen_calibration()
+        except ValueError:
+            self.set_retrain_status("Screen calibration values must be numbers.", is_error=True)
+            return
+
+        cmd = [
+            sys.executable, str(self.retrain_helper_script),
+            "--predict-only",
+            "--dlc-config", str(Path(self.retrain_config_input.text().strip()).expanduser()),
+            "--labels-root", str(self.get_manual_labels_pool_root() or self.default_manual_labels_root),
+            "--video-path", str(self.video_path),
+            "--run-model-script", str(run_model_script),
+            "--model-path", str(model_path.resolve()),
+            "--cam-name", self.retrain_cam_name_input.text().strip() or "top",
+            "--calibration-dir", str(calibration_dir),
+        ]
+        if screen_start_x is not None:
+            cmd.extend(["--screen-start-x", str(screen_start_x)])
+        if screen_pix_cm is not None:
+            cmd.extend(["--screen-pix-cm", str(screen_pix_cm)])
+        if screen_y is not None:
+            cmd.extend(["--screen-y", str(screen_y)])
+
+        self.save_preferences()
+        self._model_action = "prediction"
+        labels_root = self.get_manual_labels_pool_root() or self.default_manual_labels_root
+        self.launch_model_process(cmd, labels_root, "prediction")
+
+    def launch_model_process(self, cmd: List[str], labels_root: Path, action: str):
+        """Launch a retrain or prediction helper without blocking the UI."""
+        log_dir = labels_root / "retrain_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.retrain_log_path = log_dir / f"retrain_{timestamp}.log"
+        self.retrain_log_path = log_dir / f"{action}_{timestamp}.log"
         
         try:
             self.retrain_log_handle = open(self.retrain_log_path, "w", encoding="utf-8")
@@ -3407,14 +3522,14 @@ class VideoOverlayPlayer(QMainWindow):
             self.refresh_background_action_buttons()
             self.retrain_poll_timer.start(1000)
             self.set_retrain_status(
-                f"Retrain started (PID {self.retrain_process.pid}). Log: {self.retrain_log_path}"
+                f"{action.title()} started (PID {self.retrain_process.pid}). Log: {self.retrain_log_path}"
             )
         except Exception as e:
             if self.retrain_log_handle is not None:
                 self.retrain_log_handle.close()
                 self.retrain_log_handle = None
             self.retrain_process = None
-            self.set_retrain_status(f"Failed to start retrain: {e}", is_error=True)
+            self.set_retrain_status(f"Failed to start {action}: {e}", is_error=True)
     
     def poll_retrain_process(self):
         """Check retrain subprocess completion without blocking UI."""
@@ -3432,18 +3547,19 @@ class VideoOverlayPlayer(QMainWindow):
             self.retrain_log_handle = None
         
         log_text = str(self.retrain_log_path) if self.retrain_log_path else "(no log file)"
+        action = self._model_action.title()
         if return_code == 0:
-            self.set_retrain_status(f"Retrain finished successfully. Log: {log_text}")
+            self.set_retrain_status(f"{action} finished successfully. Log: {log_text}")
             self.set_edit_status(
-                f"Retrain finished. Check log: {log_text}"
+                f"{action} finished. Check log: {log_text}"
             )
         else:
             self.set_retrain_status(
-                f"Retrain failed with exit code {return_code}. Log: {log_text}",
+                f"{action} failed with exit code {return_code}. Log: {log_text}",
                 is_error=True
             )
             self.set_edit_status(
-                f"Retrain failed (exit {return_code}). Check log: {log_text}",
+                f"{action} failed (exit {return_code}). Check log: {log_text}",
                 is_error=True
             )
         
@@ -3607,6 +3723,9 @@ class VideoOverlayPlayer(QMainWindow):
         self.video_path = video_path
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        self.frame_number_spin.setRange(0, max(0, self.total_frames - 1))
+        self.frame_number_spin.setEnabled(self.total_frames > 0)
         
         print(f"Video loaded: {self.total_frames} frames @ {self.fps} fps")
         
@@ -3881,8 +4000,11 @@ class VideoOverlayPlayer(QMainWindow):
             return
         
         try:
-            # Seek to current frame
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
+            # Sequential playback is already positioned at the next frame. Only
+            # ask the decoder to seek after an actual jump.
+            decoder_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+            if decoder_frame != self.current_frame:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
             ret, frame = self.cap.read()
             
             if not ret:
@@ -4084,6 +4206,10 @@ class VideoOverlayPlayer(QMainWindow):
             self.progress_slider.blockSignals(True)
             self.progress_slider.setValue(self.current_frame)
             self.progress_slider.blockSignals(False)
+
+            self.frame_number_spin.blockSignals(True)
+            self.frame_number_spin.setValue(self.current_frame)
+            self.frame_number_spin.blockSignals(False)
         
         except Exception as e:
             print(f"ERROR in display_frame: {e}")
@@ -4219,6 +4345,13 @@ class VideoOverlayPlayer(QMainWindow):
             self.clear_drag_state()
             self.current_frame = frame_num
             self.display_frame()
+
+    def go_to_frame_number(self):
+        """Jump directly to the frame entered in the frame-number control."""
+        if self.cap is None or self.total_frames <= 0:
+            return
+        self.pause_video()
+        self.seek_frame(self.frame_number_spin.value())
     
     def should_ignore_saved_path(self, path_str: str) -> bool:
         """Ignore temporary test paths when restoring/saving preferences."""
@@ -4265,8 +4398,9 @@ class VideoOverlayPlayer(QMainWindow):
                     retrain_config = prefs.get('retrain_config_path', '')
                     retrain_run_model = prefs.get('retrain_run_model_script', '')
                     manual_labels_root = prefs.get('manual_labels_root', '')
-                    retrain_model_path = prefs.get('retrain_model_path', '')
-                    retrain_model_name = prefs.get('retrain_model_name', '')
+                    source_model_path = prefs.get('source_model_path', '')
+                    retrained_model_path = prefs.get('retrained_model_path', '')
+                    prediction_model_path = prefs.get('prediction_model_path', prefs.get('retrain_model_path', ''))
                     retrain_cam_name = prefs.get('retrain_cam_name', 'top')
                     retrain_iterations = prefs.get('retrain_iterations', 5000)
                     calibration_preset = prefs.get('calibration_preset', '')
@@ -4286,10 +4420,12 @@ class VideoOverlayPlayer(QMainWindow):
                             self.run_model_script_input.setText(str(default_run_model))
                     if manual_labels_root:
                         self.manual_labels_root_input.setText(manual_labels_root)
-                    if retrain_model_path:
-                        self.retrain_model_path_input.setText(retrain_model_path)
-                    if retrain_model_name:
-                        self.retrain_model_name_input.setText(retrain_model_name)
+                    if source_model_path:
+                        self.source_model_path_input.setText(source_model_path)
+                    if retrained_model_path:
+                        self.retrained_model_path_input.setText(retrained_model_path)
+                    if prediction_model_path:
+                        self.prediction_model_path_input.setText(prediction_model_path)
                     if retrain_cam_name:
                         self.retrain_cam_name_input.setText(retrain_cam_name)
                     if calibration_dir:
@@ -4313,8 +4449,8 @@ class VideoOverlayPlayer(QMainWindow):
             default_run_model = Path.home() / "Dev" / "PreyTouch" / "Arena" / "run_model.py"
             if default_run_model.exists():
                 self.run_model_script_input.setText(str(default_run_model))
-        if not self.retrain_model_path_input.text().strip():
-            self.retrain_model_path_input.setText(str(self.default_model_root))
+        if not self.prediction_model_path_input.text().strip():
+            self.prediction_model_path_input.setText(self.retrained_model_path_input.text())
         if not self.manual_labels_root_input.text().strip():
             self.manual_labels_root_input.setText(str(self.default_manual_labels_root))
         if not self.calibration_dir_input.text().strip() and self.default_calibration_dir is not None:
@@ -4345,8 +4481,9 @@ class VideoOverlayPlayer(QMainWindow):
                 'retrain_config_path': self.retrain_config_input.text().strip(),
                 'retrain_run_model_script': self.run_model_script_input.text().strip(),
                 'manual_labels_root': self.manual_labels_root_input.text().strip(),
-                'retrain_model_path': self.retrain_model_path_input.text().strip(),
-                'retrain_model_name': self.retrain_model_name_input.text().strip(),
+                'source_model_path': self.source_model_path_input.text().strip(),
+                'retrained_model_path': self.retrained_model_path_input.text().strip(),
+                'prediction_model_path': self.prediction_model_path_input.text().strip(),
                 'retrain_cam_name': self.retrain_cam_name_input.text().strip(),
                 'retrain_iterations': int(self.retrain_iters_spin.value()),
                 'calibration_preset': self.calibration_preset_combo.currentData() or '',
