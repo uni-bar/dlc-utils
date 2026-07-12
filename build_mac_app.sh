@@ -1,4 +1,6 @@
 #!/bin/bash
+set -e
+
 # Build standalone Mac app for DLC Video Overlay Tool
 
 echo "Building Mac application for DLC Video Overlay Tool..."
@@ -12,10 +14,9 @@ fi
 
 # Create the app bundle
 pyinstaller --clean \
+    --noconfirm \
     --name "DLC Video Overlay" \
     --windowed \
-    --onefile \
-    --icon=app_icon.icns \
     --add-data "README.md:." \
     --add-data "retrain_dlc_from_manual_labels.py:." \
     --add-data "configs/head_only_config.yaml:configs" \
@@ -24,7 +25,8 @@ pyinstaller --clean \
     --hidden-import=pandas \
     --hidden-import=numpy \
     --hidden-import=pyarrow \
-    --hidden-import=fastparquet \
+    --exclude-module=matplotlib \
+    --exclude-module=mpl_toolkits \
     --osx-bundle-identifier=com.preytouch.dlcvideooverlay \
     dlc_video_overlay.py
 
