@@ -461,7 +461,7 @@ def load_bug_trajectory(video_path):
         return None
     bug_traj = pd.read_csv(csv_path, index_col=0)
     bug_traj = rename_bug_columns(bug_traj)
-    bug_traj["datetime"] = pd.to_datetime(bug_traj["time"]).dt.tz_localize(None)
+    bug_traj["datetime"] = bug_traj["time"].map(pd.to_datetime).dt.tz_localize(None)
     bug_traj["timestamp"] = bug_traj["datetime"].astype(int).div(10**9)
     return bug_traj.sort_values("datetime").reset_index(drop=True)
 
@@ -610,4 +610,3 @@ if __name__ == "__main__":
 # model="/media/sil4/Data1/Bareket/models/deeplabcut/front_top_head_resnet_152_retrained"
 # cam="top"
 # python run_model.py -p $model -v $videos -c $cam --calib_dir $calib --skip_existing --start_x 7.59 --pix_cm 0.027604 --screen_y -4.3
-
