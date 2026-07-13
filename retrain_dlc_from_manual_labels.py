@@ -401,8 +401,27 @@ def find_snapshot_prefix(model_path: Path) -> Path:
     return prefix
 
 
-def configure_training_init_weights(project_path: Path, source_snapshot: Path):
-    """Force generated DLC training configs to initialize from the chosen snapshot."""
+def read_source_model_type(source_model_path: Path, source_snapshot: Path) -> str:
+    """Read the network type from the selected trained model."""
+    yaml = require_yaml()
+    pose_configs = [source_snapshot.parent / "pose_cfg.yaml"]
+    pose_configs.extend(sorted(source_model_path.rglob("pose_cfg.yaml")))
+    source_pose_config = next((path for path in pose_configs if path.is_file()), None)
+    if source_pose_config is None:
+        raise RuntimeError(f"No pose_cfg.yaml found under source model: {source_model_path}")
+
+    with open(source_pose_config, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    net_type = cfg.get("net_type")
+    if not net_type:
+        raise RuntimeError(f"Source model pose config has no net_type: {source_pose_config}")
+    log(f"VERIFIED source pose config: {source_pose_config}")
+    log(f"VERIFIED source network type: {net_type}")
+    return str(net_type)
+
+
+def verify_training_init_weights(project_path: Path, source_snapshot: Path):
+    """Verify DLC generated the training config from the selected snapshot."""
     yaml = require_yaml()
     pose_configs = sorted(
         project_path.glob("dlc-models/iteration-*/**/train/pose_cfg.yaml"),
@@ -415,17 +434,39 @@ def configure_training_init_weights(project_path: Path, source_snapshot: Path):
     pose_config = pose_configs[0]
     with open(pose_config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    cfg["init_weights"] = str(source_snapshot)
-    with open(pose_config, "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
-
-    with open(pose_config, "r", encoding="utf-8") as f:
-        written_cfg = yaml.safe_load(f) or {}
-    if written_cfg.get("init_weights") != str(source_snapshot):
-        raise RuntimeError("Could not verify source weights in generated training config")
+    if cfg.get("init_weights") != str(source_snapshot):
+        raise RuntimeError(
+            "DeepLabCut did not initialize the training config from the selected snapshot"
+        )
     log(f"VERIFIED fine-tune initialization: {pose_config}")
     log(f"VERIFIED source weights: {source_snapshot}")
     return pose_config
+
+
+def create_training_dataset_from_snapshot(
+    deeplabcut,
+    config_path: Path,
+    shuffle: int,
+    source_snapshot: Path,
+    source_net_type: str,
+):
+    """Create the DLC dataset without looking up generic pretrained weights."""
+    training_module = importlib.import_module(
+        "deeplabcut.generate_training_dataset.trainingsetmanipulation"
+    )
+    original_weight_lookup = training_module.auxfun_models.check_for_weights
+    training_module.auxfun_models.check_for_weights = (
+        lambda *_args, **_kwargs: str(source_snapshot)
+    )
+    try:
+        deeplabcut.create_training_dataset(
+            str(config_path),
+            Shuffles=[shuffle],
+            userfeedback=False,
+            net_type=source_net_type,
+        )
+    finally:
+        training_module.auxfun_models.check_for_weights = original_weight_lookup
 
 
 def copy_exported_model(model_path: Path, output_path: Path) -> Path:
@@ -450,17 +491,19 @@ def run_dlc_retrain(
 ):
     deeplabcut = require_deeplabcut()
     source_snapshot = find_snapshot_prefix(source_model_path)
+    source_net_type = read_source_model_type(source_model_path, source_snapshot)
     log(f"VERIFIED trained source model: {source_model_path}")
 
-    log("Creating/rebuilding training dataset ...")
-    try:
-        deeplabcut.create_training_dataset(
-            str(config_path), Shuffles=[shuffle], userfeedback=False
-        )
-    except TypeError:
-        deeplabcut.create_training_dataset(str(config_path), Shuffles=[shuffle])
+    log("Creating/rebuilding training dataset from the selected trained snapshot ...")
+    create_training_dataset_from_snapshot(
+        deeplabcut,
+        config_path,
+        shuffle,
+        source_snapshot,
+        source_net_type,
+    )
 
-    configure_training_init_weights(project_path, source_snapshot)
+    verify_training_init_weights(project_path, source_snapshot)
 
     displayiters = max(100, min(1000, iterations // 20))
     saveiters = max(500, min(5000, iterations // 4))
@@ -635,12 +678,18 @@ def main():
     cfg["date"] = str(cfg.get("date", ""))
     cfg["TrainingFraction"] = [0.8]
     cfg["engine"] = "tensorflow"
+    cfg["multianimalproject"] = False
+    cfg.setdefault("pcutoff", 0.4)
+    cfg.setdefault("colormap", "jet")
     if not cfg.get("project_path"):
         project_path = output_model_path.parent / f"{output_model_path.name}_dlc_project"
         project_path.mkdir(parents=True, exist_ok=True)
+        for generated_dir in ("dlc-models", "exported-models"):
+            shutil.rmtree(project_path / generated_dir, ignore_errors=True)
         cfg["project_path"] = str(project_path)
         dlc_config_path = project_path / "config.yaml"
         log(f"Created DLC working project from template: {dlc_config_path}")
+        log("Reset generated model state so training starts from the selected source snapshot.")
     save_dlc_project_config(dlc_config_path, cfg)
     log("VERIFIED training/test split: 80%/20%")
     log("VERIFIED training engine: tensorflow (required by snapshot*.index source weights)")

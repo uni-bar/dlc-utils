@@ -14,7 +14,10 @@ TrainingFraction:
 iteration: 0
 default_net_type: resnet_152
 engine: tensorflow
+multianimalproject: false
 snapshotindex: -1
 batch_size: 1
+pcutoff: 0.4
+colormap: jet
 
 video_sets: {}

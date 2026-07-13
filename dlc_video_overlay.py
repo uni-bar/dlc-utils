@@ -3406,9 +3406,10 @@ class VideoOverlayPlayer(QMainWindow):
         source_text = self.source_model_path_input.text().strip()
         source_model = Path(source_text).expanduser() if source_text else Path()
         source_snapshots = list(source_model.rglob("snapshot*.index")) if source_model.is_dir() else []
-        if not source_text or not source_snapshots:
+        source_pose_configs = list(source_model.rglob("pose_cfg.yaml")) if source_model.is_dir() else []
+        if not source_text or not source_snapshots or not source_pose_configs:
             self.set_retrain_status(
-                "Choose a trained source model containing snapshot*.index. Training from scratch is blocked.",
+                "Choose a trained source model containing snapshot*.index and pose_cfg.yaml. Training from scratch is blocked.",
                 is_error=True,
             )
             return

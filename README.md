@@ -78,7 +78,8 @@ the target video to be loaded.
 What this workflow does:
 - Converts your exported manual labels into DLC `labeled-data/.../CollectedData_<scorer>.csv/.h5`
 - Verifies that the source folder contains trained snapshot weights
-- Forces the generated DLC training config to initialize from that snapshot
+- Uses the selected model's network type and snapshot during dataset creation
+- Blocks generic ImageNet/base-weight downloads and verifies the generated training config
 - Runs `deeplabcut.create_training_dataset` + `deeplabcut.train_network`
 - Uses an 80/20 training/test split and runs `deeplabcut.evaluate_network`
 - Writes the train/test pixel-error evaluation to the retraining log
