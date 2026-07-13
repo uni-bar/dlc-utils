@@ -587,6 +587,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.retrain_log_path = None
         self._model_action = "retrain"
         self.retrain_helper_script = Path(__file__).with_name("retrain_dlc_from_manual_labels.py")
+        self.prediction_script = Path(__file__).with_name("run_model.py")
         self._calibration_in_progress = False
         self._calibration_thread = None
         self._calibration_worker = None
@@ -859,15 +860,6 @@ class VideoOverlayPlayer(QMainWindow):
         self.retrain_status_label.setWordWrap(True)
         self.retrain_status_label.setStyleSheet("font-size: 8.5pt; color: #555555;")
         retrain_layout.addWidget(self.retrain_status_label)
-
-        run_model_row = QHBoxLayout()
-        self.run_model_script_input = QLineEdit()
-        self.run_model_script_input.setPlaceholderText("PreyTouch Arena/run_model.py")
-        run_model_browse = QPushButton("Browse")
-        run_model_browse.clicked.connect(self.browse_run_model_script)
-        run_model_row.addWidget(self.run_model_script_input)
-        run_model_row.addWidget(run_model_browse)
-        retrain_layout.addLayout(run_model_row)
 
         prediction_model_row = QHBoxLayout()
         prediction_model_row.addWidget(QLabel("Prediction model:"))
@@ -1145,22 +1137,6 @@ class VideoOverlayPlayer(QMainWindow):
             self.retrain_config_input.setText(file_path)
             self.save_preferences()
     
-    def browse_run_model_script(self):
-        """Select PreyTouch Arena/run_model.py for optional one-click rerun."""
-        start_dir = self.last_video_dir if Path(self.last_video_dir).exists() else str(Path.home())
-        current_text = self.run_model_script_input.text().strip()
-        if current_text and Path(current_text).exists():
-            start_dir = str(Path(current_text).parent)
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select run_model.py",
-            start_dir,
-            "Python Files (*.py);;All Files (*)"
-        )
-        if file_path:
-            self.run_model_script_input.setText(file_path)
-            self.save_preferences()
-
     def browse_model_folder(self, target_input: QLineEdit, title: str):
         """Select a model folder and place it in the requested input."""
         default_dir = self.default_model_root.expanduser()
@@ -3475,12 +3451,10 @@ class VideoOverlayPlayer(QMainWindow):
             self.set_retrain_status("Load the target video first.", is_error=True)
             return
 
-        run_model_text = self.run_model_script_input.text().strip()
         model_path_text = self.prediction_model_path_input.text().strip()
-        run_model_script = Path(run_model_text).expanduser() if run_model_text else Path()
         model_path = Path(model_path_text).expanduser() if model_path_text else Path()
-        if not run_model_text or not run_model_script.is_file():
-            self.set_retrain_status("Select a valid PreyTouch run_model.py.", is_error=True)
+        if not self.prediction_script.is_file():
+            self.set_retrain_status(f"Missing prediction script: {self.prediction_script}", is_error=True)
             return
         if not model_path_text or not model_path.is_dir() or not list(model_path.rglob("snapshot*.index")):
             self.set_retrain_status("Select a prediction model containing snapshot*.index.", is_error=True)
@@ -3496,22 +3470,19 @@ class VideoOverlayPlayer(QMainWindow):
             return
 
         cmd = [
-            sys.executable, str(self.retrain_helper_script),
-            "--predict-only",
-            "--dlc-config", str(Path(self.retrain_config_input.text().strip()).expanduser()),
-            "--labels-root", str(self.get_manual_labels_pool_root() or self.default_manual_labels_root),
-            "--video-path", str(self.video_path),
-            "--run-model-script", str(run_model_script),
-            "--model-path", str(model_path.resolve()),
-            "--cam-name", self.retrain_cam_name_input.text().strip() or "top",
-            "--calibration-dir", str(calibration_dir),
+            sys.executable, str(self.prediction_script),
+            "--model_path", str(model_path.resolve()),
+            "--video_path", str(self.video_path),
+            "--cam_name", self.retrain_cam_name_input.text().strip() or "top",
+            "--calib_dir", str(calibration_dir),
+            "--no_skip_existing",
         ]
         if screen_start_x is not None:
-            cmd.extend(["--screen-start-x", str(screen_start_x)])
+            cmd.extend(["--start_x", str(screen_start_x)])
         if screen_pix_cm is not None:
-            cmd.extend(["--screen-pix-cm", str(screen_pix_cm)])
+            cmd.extend(["--pix_cm", str(screen_pix_cm)])
         if screen_y is not None:
-            cmd.extend(["--screen-y", str(screen_y)])
+            cmd.extend(["--screen_y", str(screen_y)])
 
         self.save_preferences()
         self._model_action = "prediction"
@@ -4205,10 +4176,10 @@ class VideoOverlayPlayer(QMainWindow):
                             self._current_trial_id = trial_id_value
                         # else: NaN value - keep displaying the last valid _current_trial_id (don't update it)
 
-                    _, calibrated_head_available = head_overlay_columns("Raw", row.keys())
+                    use_rigid_head_overlay = self.head_overlay_mode == "Rigid"
                     for point_name, config in self.point_configs.items():
                         base_point_name = point_name[:-4] if point_name.endswith("_cam") else point_name
-                        if calibrated_head_available and base_point_name in LANDMARKS:
+                        if use_rigid_head_overlay and base_point_name in LANDMARKS:
                             continue
                         # Check if point is enabled
                         if not config.get('enabled', True):
@@ -4295,7 +4266,7 @@ class VideoOverlayPlayer(QMainWindow):
                             if collect_coords_text:
                                 point_coords_text.append(f"{point_name}: NaN")
 
-                    if calibrated_head_available:
+                    if use_rigid_head_overlay:
                         points_drawn += self.draw_head_overlay(
                             frame, row, collect_coords_text, point_coords_text
                         )
@@ -4555,7 +4526,6 @@ class VideoOverlayPlayer(QMainWindow):
                         self.start_second_spin.setValue(last_start_second)
                     
                     retrain_config = prefs.get('retrain_config_path', '')
-                    retrain_run_model = prefs.get('retrain_run_model_script', '')
                     manual_labels_root = prefs.get('manual_labels_root', '')
                     source_model_path = prefs.get('source_model_path', '')
                     retrained_model_path = prefs.get('retrained_model_path', '')
@@ -4570,13 +4540,6 @@ class VideoOverlayPlayer(QMainWindow):
                     
                     if retrain_config and Path(retrain_config).exists():
                         self.retrain_config_input.setText(retrain_config)
-                    if retrain_run_model and Path(retrain_run_model).exists():
-                        self.run_model_script_input.setText(retrain_run_model)
-                    elif not self.run_model_script_input.text().strip():
-                        # Sensible default if user did not set it yet.
-                        default_run_model = Path.home() / "Dev" / "PreyTouch" / "Arena" / "run_model.py"
-                        if default_run_model.exists():
-                            self.run_model_script_input.setText(str(default_run_model))
                     if manual_labels_root:
                         self.manual_labels_root_input.setText(manual_labels_root)
                     if source_model_path:
@@ -4604,10 +4567,6 @@ class VideoOverlayPlayer(QMainWindow):
                     )
             except Exception as e:
                 print(f"Could not load preferences: {e}")
-        if not self.run_model_script_input.text().strip():
-            default_run_model = Path.home() / "Dev" / "PreyTouch" / "Arena" / "run_model.py"
-            if default_run_model.exists():
-                self.run_model_script_input.setText(str(default_run_model))
         if not self.prediction_model_path_input.text().strip():
             self.prediction_model_path_input.setText(self.retrained_model_path_input.text())
         if not self.manual_labels_root_input.text().strip():
@@ -4638,7 +4597,6 @@ class VideoOverlayPlayer(QMainWindow):
                 'last_video_dir': self.last_video_dir,
                 'last_dlc_dir': self.last_dlc_dir,
                 'retrain_config_path': self.retrain_config_input.text().strip(),
-                'retrain_run_model_script': self.run_model_script_input.text().strip(),
                 'manual_labels_root': self.manual_labels_root_input.text().strip(),
                 'source_model_path': self.source_model_path_input.text().strip(),
                 'retrained_model_path': self.retrained_model_path_input.text().strip(),

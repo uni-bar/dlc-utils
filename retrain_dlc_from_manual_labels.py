@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""
-Retrain DeepLabCut from manual_labels exports and optionally rerun PreyTouch on one video.
-"""
+"""Retrain DeepLabCut from manual-label exports."""
 
 import argparse
 import csv
 import importlib
-import importlib.util
-import os
 import shutil
 import sys
 import traceback
@@ -545,66 +541,9 @@ def run_dlc_retrain(
     return copy_exported_model(model_path, output_model_path)
 
 
-def rerun_single_video(
-    run_model_script: Path,
-    model_path: Path,
-    cam_name: str,
-    video_path: Path,
-    calibration_dir: Optional[Path] = None,
-    screen_start_x: Optional[float] = None,
-    screen_pix_cm: Optional[float] = None,
-    screen_y: Optional[float] = None,
-):
-    run_model_script = run_model_script.expanduser().resolve()
-    if not run_model_script.exists():
-        raise RuntimeError(f"run_model.py does not exist: {run_model_script}")
-
-    video_path = video_path.expanduser().resolve()
-    if not video_path.exists():
-        raise RuntimeError(f"Video does not exist: {video_path}")
-
-    arena_dir = run_model_script.parent
-    cwd_before = Path.cwd()
-    predictor = None
-    try:
-        os.chdir(arena_dir)
-        if str(arena_dir) not in sys.path:
-            sys.path.insert(0, str(arena_dir))
-
-        spec = importlib.util.spec_from_file_location("preytouch_run_model", run_model_script)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Failed loading run_model module: {run_model_script}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-        module.config.CALIBRATION_DIR = str(calibration_dir) if calibration_dir else module.config.CALIBRATION_DIR
-        module.config.SCREEN_START_X_CM = screen_start_x
-        module.config.SCREEN_PIX_CM = screen_pix_cm
-        module.config.SCREEN_Y_CM = screen_y
-        module.config.IS_SCREEN_CONFIGURED_FOR_POSE = screen_start_x is not None and screen_pix_cm is not None
-
-        log(f"Running PreyTouch prediction on one video with model {model_path}: {video_path}")
-        pose_module = importlib.import_module("analysis.pose")
-        predictor = pose_module.DLCArenaPose(
-            cam_name,
-            model_path=str(model_path),
-            is_use_db=False,
-            is_raise_no_caliber=False,
-        )
-        predictor.predict_video(video_path=str(video_path))
-        log("Prediction finished.")
-    finally:
-        try:
-            if predictor is not None and hasattr(predictor, "close"):
-                predictor.close()
-        except Exception:
-            pass
-        os.chdir(cwd_before)
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Retrain DeepLabCut from manual_labels and optionally re-run PreyTouch prediction."
+        description="Retrain DeepLabCut from manual labels."
     )
     parser.add_argument("--dlc-config", required=True, help="Path to DLC project config.yaml")
     parser.add_argument(
@@ -618,44 +557,18 @@ def main():
     parser.add_argument("--iterations", type=int, default=5000, help="maxiters for train_network")
     parser.add_argument("--source-model", default=None, help="Required trained model used as initial weights")
     parser.add_argument("--output-model", default=None, help="Destination folder for the retrained model")
-    parser.add_argument("--predict-only", action="store_true", help="Run prediction without retraining")
-    parser.add_argument("--run-model-script", default=None, help="Path to PreyTouch Arena/run_model.py")
-    parser.add_argument("--model-path", default=None, help="Optional explicit model folder path")
-    parser.add_argument("--cam-name", default="top", help="Camera name for rerun")
-    parser.add_argument("--calibration-dir", default=None)
-    parser.add_argument("--screen-start-x", type=float, default=None)
-    parser.add_argument("--screen-pix-cm", type=float, default=None)
-    parser.add_argument("--screen-y", type=float, default=None)
     args = parser.parse_args()
 
     dlc_config_path = Path(args.dlc_config).expanduser().resolve()
     labels_root = Path(args.labels_root).expanduser().resolve()
     video_path = Path(args.video_path).expanduser().resolve() if args.video_path else None
-    run_model_script = (
-        Path(args.run_model_script).expanduser().resolve() if args.run_model_script else None
-    )
-    model_path_override = Path(args.model_path).expanduser().resolve() if args.model_path else None
     source_model_path = Path(args.source_model).expanduser().resolve() if args.source_model else None
     output_model_path = Path(args.output_model).expanduser().resolve() if args.output_model else None
-
-    if args.predict_only:
-        if not run_model_script or not video_path or not model_path_override:
-            raise RuntimeError("Prediction requires run-model-script, video-path, and model-path")
-        find_snapshot_prefix(model_path_override)
-        rerun_single_video(
-            run_model_script, model_path_override, args.cam_name, video_path,
-            Path(args.calibration_dir).expanduser().resolve() if args.calibration_dir else None,
-            args.screen_start_x, args.screen_pix_cm, args.screen_y,
-        )
-        log("Prediction done.")
-        return
 
     if not dlc_config_path.exists():
         raise RuntimeError(f"DLC config not found: {dlc_config_path}")
     if not labels_root.exists():
         raise RuntimeError(f"labels-root not found: {labels_root}")
-    if model_path_override is not None and not model_path_override.exists():
-        raise RuntimeError(f"model-path not found: {model_path_override}")
     if source_model_path is None or not source_model_path.exists():
         raise RuntimeError("A valid --source-model is required; retraining from scratch is not allowed")
     if output_model_path is None:

@@ -5,7 +5,7 @@ a = Analysis(
     ['dlc_video_overlay.py'],
     pathex=[],
     binaries=[],
-    datas=[('README.md', '.'), ('retrain_dlc_from_manual_labels.py', '.'), ('configs/head_only_config.yaml', 'configs')],
+    datas=[('README.md', '.'), ('retrain_dlc_from_manual_labels.py', '.'), ('run_model.py', '.'), ('configs/head_only_config.yaml', 'configs')],
     hiddenimports=['PyQt5', 'cv2', 'pandas', 'numpy', 'pyarrow'],
     hookspath=[],
     hooksconfig={},

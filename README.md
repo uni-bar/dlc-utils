@@ -86,12 +86,13 @@ What this workflow does:
 - Exports and verifies the retrained model in the selected output folder
 
 To run the model on the loaded video:
-1. Choose PreyTouch `Arena/run_model.py`.
-2. The prediction model defaults to the retrained output folder, but can be changed.
-3. Choose the calibration folder/settings and camera.
-4. Click `Run Prediction Model`.
+1. The prediction model defaults to the retrained output folder, but can be changed.
+2. Choose the calibration folder/settings and camera.
+3. Click `Run Prediction Model`.
 
-Prediction constructs `DLCArenaPose` directly from the selected model folder and runs it with the selected calibration settings on the currently loaded video. `predict_config.json` is not used or changed.
+Prediction invokes the bundled standalone `run_model.py` with the selected model,
+loaded video, camera, and calibration arguments. It does not import Arena or use
+`predict_config.json`.
 
 Logs are written to:
 - `<video_folder>/manual_labels/<video_stem>/retrain_logs/retrain_*.log`
