@@ -71,7 +71,7 @@ which python3
 
 Missing packages:
 ```bash
-pip install PyQt5 opencv-python pandas numpy pyarrow fastparquet
+pip install PyQt5 "opencv-python-headless<4.12" pandas "numpy<2" pyarrow fastparquet
 ```
 
 ## 📍 File Locations

@@ -340,13 +340,21 @@ def build_dlc_labeled_dataset(
     }
 
 
-def ensure_video_in_config(cfg: dict, video_path: Optional[Path]) -> bool:
-    if video_path is None:
-        return False
+def ensure_dataset_in_config(
+    cfg: dict,
+    project_path: Path,
+    dataset_name: str,
+    video_path: Optional[Path],
+) -> bool:
+    """Register the labeled-data folder even when retraining without a loaded video."""
     video_sets = cfg.get("video_sets")
     if not isinstance(video_sets, dict):
         video_sets = {}
-    video_key = str(video_path.expanduser().resolve())
+    video_key = str(
+        video_path.expanduser().resolve()
+        if video_path is not None
+        else project_path / "videos" / f"{dataset_name}.mp4"
+    )
     if video_key in video_sets:
         return False
     video_sets[video_key] = {}
@@ -622,6 +630,7 @@ def main():
 
     cfg, project_path, scorer, bodyparts = load_dlc_project_config(dlc_config_path)
     cfg["TrainingFraction"] = [0.8]
+    cfg["engine"] = "tensorflow"
     if not cfg.get("project_path"):
         project_path = output_model_path.parent / f"{output_model_path.name}_dlc_project"
         project_path.mkdir(parents=True, exist_ok=True)
@@ -630,6 +639,7 @@ def main():
         log(f"Created DLC working project from template: {dlc_config_path}")
     save_dlc_project_config(dlc_config_path, cfg)
     log("VERIFIED training/test split: 80%/20%")
+    log("VERIFIED training engine: tensorflow (required by snapshot*.index source weights)")
     dataset_name = args.dataset_name or (video_path.stem if video_path else labels_root.name)
     log(f"DLC project path: {project_path}")
     log(f"Scorer: {scorer}")
@@ -657,9 +667,9 @@ def main():
     log(f"Collected H5: {prep_stats['h5_path']}")
     log(f"VERIFIED new manual training samples: {prep_stats['sample_count']}")
 
-    if ensure_video_in_config(cfg, video_path):
+    if ensure_dataset_in_config(cfg, project_path, dataset_name, video_path):
         save_dlc_project_config(dlc_config_path, cfg)
-        log("Updated DLC config video_sets with current video.")
+        log(f"Registered labeled-data dataset in DLC config: {dataset_name}")
 
     model_path = run_dlc_retrain(
         config_path=dlc_config_path,
