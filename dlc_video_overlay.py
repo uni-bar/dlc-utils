@@ -3525,11 +3525,21 @@ class VideoOverlayPlayer(QMainWindow):
         self.retrain_log_path = log_dir / f"{action}_{timestamp}.log"
         
         try:
+            process_env = os.environ.copy()
+            conda_prefix = process_env.get("CONDA_PREFIX")
+            if sys.platform.startswith("linux") and conda_prefix:
+                conda_lib = str(Path(conda_prefix) / "lib")
+                current_library_path = process_env.get("LD_LIBRARY_PATH", "")
+                process_env["LD_LIBRARY_PATH"] = (
+                    f"{conda_lib}:{current_library_path}"
+                    if current_library_path else conda_lib
+                )
             self.retrain_log_handle = open(self.retrain_log_path, "w", encoding="utf-8")
             self.retrain_process = subprocess.Popen(
                 cmd,
                 stdout=self.retrain_log_handle,
-                stderr=subprocess.STDOUT
+                stderr=subprocess.STDOUT,
+                env=process_env,
             )
             self.refresh_background_action_buttons()
             self.retrain_poll_timer.start(1000)
