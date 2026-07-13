@@ -10,6 +10,7 @@ import importlib.util
 import os
 import shutil
 import sys
+import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -33,7 +34,9 @@ def require_yaml():
 def require_deeplabcut():
     try:
         import deeplabcut  # type: ignore
-    except Exception as exc:
+    except ModuleNotFoundError as exc:
+        if exc.name != "deeplabcut":
+            raise
         raise RuntimeError(
             "DeepLabCut is required for retraining. Install in the active environment."
         ) from exc
@@ -687,5 +690,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
+        traceback.print_exc()
         log(f"ERROR: {exc}")
         sys.exit(1)
