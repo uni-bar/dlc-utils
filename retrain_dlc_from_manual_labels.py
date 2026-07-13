@@ -632,6 +632,7 @@ def main():
         log(f"Video path: {video_path}")
 
     cfg, project_path, scorer, bodyparts = load_dlc_project_config(dlc_config_path)
+    cfg["date"] = str(cfg.get("date", ""))
     cfg["TrainingFraction"] = [0.8]
     cfg["engine"] = "tensorflow"
     if not cfg.get("project_path"):

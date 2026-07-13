@@ -200,6 +200,16 @@ python -m pip install "numpy==1.26.4" "tensorflow==2.10.0"
 python -m pip install "deeplabcut[tf]==2.3.11" "deeplabcut-live[tf]==1.1.0"
 ```
 
+On a Linux GPU server, TensorFlow 2.10 also needs CUDA 11.2 and cuDNN 8.1.
+Install them inside the same Conda environment and expose its library folder:
+
+```bash
+conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0 "libstdcxx-ng>=11" "libgcc-ng>=11" pyzmq
+conda env config vars set LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+conda deactivate
+conda activate pt
+```
+
 Do not combine `deeplabcut[tf] 3.0.0` and `deeplabcut-live[tf] 1.1.0`: their
 TensorFlow requirements do not overlap.
 
