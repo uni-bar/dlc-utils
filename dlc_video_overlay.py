@@ -5,6 +5,7 @@ A lightweight video player with DeepLabCut point overlay capabilities
 """
 
 import sys
+import os
 import csv
 import importlib
 import json
@@ -21,13 +22,14 @@ from typing import Any, Dict, Iterable, List, Tuple, Optional
 import cv2
 import pandas as pd
 import numpy as np
+from rigid_head import LANDMARKS, add_rigid_head_correction, head_overlay_columns, rigid_head_summary
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QCheckBox,
     QScrollArea, QGroupBox, QSpinBox, QColorDialog, QSlider, QSizePolicy,
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QMessageBox
 )
-from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, QUrl
+from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, QUrl, QLibraryInfo
 from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QPen, QDesktopServices
 
 DEFAULT_APP_CALIBRATION_DIR = None
@@ -579,6 +581,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.export_labels_dir = None
         self.export_log_path = None
         self.draw_point_names = False
+        self.head_overlay_mode = "Raw"
         self.retrain_process = None
         self.retrain_log_handle = None
         self.retrain_log_path = None
@@ -719,6 +722,17 @@ class VideoOverlayPlayer(QMainWindow):
         self.save_edits_btn = QPushButton("Save Edits Now")
         self.save_edits_btn.clicked.connect(self.persist_dlc_edits)
         edit_layout.addWidget(self.save_edits_btn)
+
+        rigid_head_layout = QHBoxLayout()
+        self.apply_rigid_head_btn = QPushButton("Apply rigid head")
+        self.apply_rigid_head_btn.clicked.connect(self.apply_rigid_head)
+        rigid_head_layout.addWidget(self.apply_rigid_head_btn)
+        rigid_head_layout.addWidget(QLabel("Head overlay:"))
+        self.head_overlay_combo = QComboBox()
+        self.head_overlay_combo.addItems(["Raw", "Rigid"])
+        self.head_overlay_combo.currentTextChanged.connect(self.change_head_overlay)
+        rigid_head_layout.addWidget(self.head_overlay_combo)
+        edit_layout.addLayout(rigid_head_layout)
         
         self.clear_frame_btn = QPushButton("No Head (Clear Frame)")
         self.clear_frame_btn.setStyleSheet(
@@ -3377,9 +3391,6 @@ class VideoOverlayPlayer(QMainWindow):
         if self.retrain_process is not None and self.retrain_process.poll() is None:
             self.set_retrain_status("Retrain is already running. Wait for completion.", is_error=True)
             return
-        if self.video_path is None or self.dlc_data is None:
-            self.set_retrain_status("Load video + DLC first.", is_error=True)
-            return
         if not self.retrain_helper_script.exists():
             self.set_retrain_status(
                 f"Missing helper script: {self.retrain_helper_script}",
@@ -3439,11 +3450,12 @@ class VideoOverlayPlayer(QMainWindow):
             str(self.retrain_helper_script),
             "--dlc-config", str(config_path),
             "--labels-root", str(labels_pool_root),
-            "--video-path", str(self.video_path),
             "--iterations", str(int(self.retrain_iters_spin.value())),
             "--source-model", str(source_model.resolve()),
             "--output-model", str(output_model.resolve()),
         ]
+        if self.video_path:
+            cmd.extend(["--video-path", str(self.video_path)])
 
         self.prediction_model_path_input.setText(str(output_model))
         self.save_preferences()
@@ -3691,6 +3703,10 @@ class VideoOverlayPlayer(QMainWindow):
         self._load_after_save_paths = None
         self._loaded_dlc_signature = None
         self.coords_are_normalized = False
+        self.head_overlay_mode = "Raw"
+        self.head_overlay_combo.blockSignals(True)
+        self.head_overlay_combo.setCurrentText("Raw")
+        self.head_overlay_combo.blockSignals(False)
         if hasattr(self, "_coords_checked"):
             delattr(self, "_coords_checked")
         self.refresh_flip_ears_button()
@@ -3857,7 +3873,8 @@ class VideoOverlayPlayer(QMainWindow):
             for suffix in ['_x', '_y', '_likelihood']:
                 if col_str.endswith(suffix):
                     point_name = col_str[:-len(suffix)]
-                    all_point_names.add(point_name)
+                    if not point_name.startswith("rigid_"):
+                        all_point_names.add(point_name)
                     break
         
         # Prefer editing/displaying *_cam points only (raw camera coordinates).
@@ -3993,6 +4010,128 @@ class VideoOverlayPlayer(QMainWindow):
             # Force redraw if video is loaded
             if self.cap is not None:
                 self.display_frame()
+
+    def apply_rigid_head(self):
+        """Compute rigid head columns in memory; the normal Save button persists them."""
+        if self.dlc_data is None:
+            self.set_edit_status("Load a trajectories file before applying rigid head.", is_error=True)
+            return
+        self.apply_rigid_head_btn.setEnabled(False)
+        self.apply_rigid_head_btn.setText("Applying rigid head...")
+        QApplication.processEvents()
+        raw_columns = [f"{name}_{axis}" for name in LANDMARKS for axis in ("x", "y")]
+        try:
+            raw_before = self.dlc_data[raw_columns].copy(deep=True)
+            corrected = add_rigid_head_correction(self.dlc_data)
+            pd.testing.assert_frame_equal(corrected[raw_columns], raw_before)
+            assert corrected.index.equals(self.dlc_data.index)
+            self.dlc_data = corrected
+            self.begin_edit_revision()
+            self._pending_save = True
+            self._last_dlc_row_idx = -1
+            self.head_overlay_combo.setCurrentText("Rigid")
+            summary = rigid_head_summary(corrected)
+            message = (
+                "Rigid head correction applied: "
+                f"{summary['total_rows']} total rows, "
+                f"{summary['corrected_rows']} corrected rows, "
+                f"{summary['raw_valid_rows']} raw-valid rows, "
+                f"{summary['unavailable_rows']} unavailable rows; "
+                f"{summary['carried_rows']} carried; "
+                f"{summary['corrected_trials']} trials corrected. "
+                "Not saved yet; click Save Edits Now to persist the new columns."
+            )
+            self.set_edit_status(message)
+            print(message)
+            self.display_frame()
+        except Exception as exc:
+            self.set_edit_status(f"Rigid head correction failed: {exc}", is_error=True)
+        finally:
+            self.apply_rigid_head_btn.setEnabled(True)
+            self.apply_rigid_head_btn.setText("Apply rigid head")
+
+    def change_head_overlay(self, mode: str):
+        """Switch rendering columns without recomputing rigid correction."""
+        if mode == "Rigid":
+            _, available = head_overlay_columns("Rigid", self.dlc_data.columns if self.dlc_data is not None else [])
+            if not available:
+                self.head_overlay_combo.blockSignals(True)
+                self.head_overlay_combo.setCurrentText("Raw")
+                self.head_overlay_combo.blockSignals(False)
+                self.set_edit_status("Apply rigid head correction first.", is_error=True)
+                return
+        self.head_overlay_mode = mode
+        self._last_dlc_row_idx = -1
+        if self.cap is not None:
+            self.display_frame()
+
+    def draw_head_overlay(self, frame: np.ndarray, row: Dict[str, Any], collect_text: bool,
+                          point_coords_text: Optional[List[str]]) -> int:
+        """Draw the calibrated raw or rigid head triangle for one dataframe row."""
+        mapping, available = head_overlay_columns(self.head_overlay_mode, row.keys())
+        if not available:
+            return 0
+        using_rigid = self.head_overlay_mode == "Rigid"
+        values = {
+            name: (row[x_column], row[y_column])
+            for name, (x_column, y_column) in mapping.items()
+        }
+        rigid_available = all(pd.notna(x) and pd.notna(y) for x, y in values.values())
+        raw_fallback = using_rigid and not rigid_available
+        if raw_fallback:
+            mapping, available = head_overlay_columns("Raw", row.keys())
+            if not available:
+                return 0
+            values = {
+                name: (row[x_column], row[y_column])
+                for name, (x_column, y_column) in mapping.items()
+            }
+
+        pixels = {}
+        for name, (x, y) in values.items():
+            config = self.point_configs.get(name) or self.point_configs.get(f"{name}_cam") or {}
+            if config and not config.get("enabled", True):
+                continue
+            if pd.isna(x) or pd.isna(y):
+                continue
+            x_raw, y_raw = float(x), float(y)
+            if not hasattr(self, '_coords_checked'):
+                self._coords_checked = True
+                self.coords_are_normalized = 0 <= x_raw <= 1 and 0 <= y_raw <= 1
+            if self.coords_are_normalized:
+                point = (int(x_raw * frame.shape[1]), int(y_raw * frame.shape[0]))
+            else:
+                point = (int(x_raw), int(y_raw))
+            if not (0 <= point[0] < frame.shape[1] and 0 <= point[1] < frame.shape[0]):
+                continue
+            pixels[name] = point
+            color = config.get("color", (0, 255, 255))
+            corrected_row = using_rigid and not raw_fallback and bool(row.get("is_rigid", False))
+            ring_color = (255, 128, 0) if corrected_row else (255, 255, 255)
+            cv2.circle(frame, point, 5, color, -1)
+            cv2.circle(frame, point, 8 if corrected_row else 7, ring_color, 2 if corrected_row else 1)
+            if self.draw_point_names:
+                cv2.putText(frame, name, (point[0] + 10, point[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            if collect_text:
+                point_coords_text.append(f"{name}: ({point[0]}, {point[1]})")
+
+        if using_rigid and not raw_fallback and len(pixels) == 3:
+            corrected_row = bool(row.get("is_rigid", False))
+            line_color = (255, 128, 0) if corrected_row else (220, 220, 220)
+            width = 2 if corrected_row else 1
+            cv2.line(frame, pixels["left_ear"], pixels["right_ear"], line_color, width)
+            cv2.line(frame, pixels["left_ear"], pixels["nose"], line_color, width)
+            cv2.line(frame, pixels["right_ear"], pixels["nose"], line_color, width)
+        if collect_text and using_rigid:
+            if raw_fallback:
+                point_coords_text.append("rigid: unavailable (raw fallback)")
+            else:
+                point_coords_text.append(
+                    f"rigid_method: {row.get('rigid_method', 'unavailable')} | "
+                    f"is_rigid: {bool(row.get('is_rigid', False))}"
+                )
+        return len(pixels)
         
     def display_frame(self):
         """Display current frame with overlays"""
@@ -4054,8 +4193,12 @@ class VideoOverlayPlayer(QMainWindow):
                                 print(f"Frame {self.current_frame}: Trial ID = {trial_id_value}")
                             self._current_trial_id = trial_id_value
                         # else: NaN value - keep displaying the last valid _current_trial_id (don't update it)
-                    
+
+                    _, calibrated_head_available = head_overlay_columns("Raw", row.keys())
                     for point_name, config in self.point_configs.items():
+                        base_point_name = point_name[:-4] if point_name.endswith("_cam") else point_name
+                        if calibrated_head_available and base_point_name in LANDMARKS:
+                            continue
                         # Check if point is enabled
                         if not config.get('enabled', True):
                             if self.current_frame == self.start_frame:
@@ -4140,6 +4283,11 @@ class VideoOverlayPlayer(QMainWindow):
                                 print(f"Point {point_name} has NaN values: x={x}, y={y}")
                             if collect_coords_text:
                                 point_coords_text.append(f"{point_name}: NaN")
+
+                    if calibrated_head_available:
+                        points_drawn += self.draw_head_overlay(
+                            frame, row, collect_coords_text, point_coords_text
+                        )
                 
                 if self.current_frame % 300 == 0:  # Log every 300 frames
                     print(f"Frame {self.current_frame}: Drew {points_drawn}/{len(self.point_configs)} points")
@@ -4635,6 +4783,12 @@ class VideoOverlayPlayer(QMainWindow):
 
 
 def main():
+    if sys.platform.startswith("linux"):
+        # OpenCV wheels may point Qt at cv2/qt/plugins, which is incompatible
+        # with the PyQt5 runtime used by this application.
+        pyqt_plugins = QLibraryInfo.location(QLibraryInfo.PluginsPath)
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = pyqt_plugins
+        QApplication.setLibraryPaths([pyqt_plugins])
     app = QApplication(sys.argv)
     player = VideoOverlayPlayer()
     player.show()
