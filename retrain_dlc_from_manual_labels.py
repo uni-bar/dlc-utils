@@ -465,6 +465,14 @@ def run_dlc_retrain(
         saveiters=int(saveiters),
     )
 
+    log("Evaluating the trained network on the held-out test data ...")
+    deeplabcut.evaluate_network(
+        str(config_path),
+        Shuffles=[shuffle],
+        plotting=False,
+    )
+    log("VERIFIED train/test evaluation completed.")
+
     log("Exporting latest model ...")
     try:
         deeplabcut.export_model(str(config_path), shuffle=shuffle, make_tar=False)
@@ -613,13 +621,15 @@ def main():
         log(f"Video path: {video_path}")
 
     cfg, project_path, scorer, bodyparts = load_dlc_project_config(dlc_config_path)
+    cfg["TrainingFraction"] = [0.8]
     if not cfg.get("project_path"):
         project_path = output_model_path.parent / f"{output_model_path.name}_dlc_project"
         project_path.mkdir(parents=True, exist_ok=True)
         cfg["project_path"] = str(project_path)
         dlc_config_path = project_path / "config.yaml"
-        save_dlc_project_config(dlc_config_path, cfg)
         log(f"Created DLC working project from template: {dlc_config_path}")
+    save_dlc_project_config(dlc_config_path, cfg)
+    log("VERIFIED training/test split: 80%/20%")
     dataset_name = args.dataset_name or (video_path.stem if video_path else labels_root.name)
     log(f"DLC project path: {project_path}")
     log(f"Scorer: {scorer}")
@@ -633,6 +643,8 @@ def main():
         bodyparts=bodyparts,
         dataset_name=dataset_name,
     )
+    if prep_stats["sample_count"] < 2:
+        raise RuntimeError("At least two valid manually labeled images are required for a train/test split")
     log(
         "Prepared labeled-data dataset: "
         f"sources={prep_stats['source_count']}, "

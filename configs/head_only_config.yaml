@@ -9,7 +9,7 @@ bodyparts:
   - right_ear
 
 TrainingFraction:
-  - 0.95
+  - 0.8
 
 iteration: 0
 default_net_type: resnet_152
