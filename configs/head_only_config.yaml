@@ -13,6 +13,7 @@ TrainingFraction:
 
 iteration: 0
 default_net_type: resnet_152
+engine: tensorflow
 snapshotindex: -1
 batch_size: 1
 

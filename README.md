@@ -71,11 +71,17 @@ After exporting corrected labels:
 3. Choose an empty output folder for the retrained model.
 4. Set the number of iterations and click `Retrain`.
 
+Retraining does not require a video or parquet to be loaded. It uses the images
+and labels in the selected shared manual-labels folder. Prediction does require
+the target video to be loaded.
+
 What this workflow does:
 - Converts your exported manual labels into DLC `labeled-data/.../CollectedData_<scorer>.csv/.h5`
 - Verifies that the source folder contains trained snapshot weights
 - Forces the generated DLC training config to initialize from that snapshot
 - Runs `deeplabcut.create_training_dataset` + `deeplabcut.train_network`
+- Uses an 80/20 training/test split and runs `deeplabcut.evaluate_network`
+- Writes the train/test pixel-error evaluation to the retraining log
 - Exports and verifies the retrained model in the selected output folder
 
 To run the model on the loaded video:
@@ -172,9 +178,34 @@ Point colors and enabled states are saved to `~/.dlc_video_overlay_prefs.json` a
 
 **Slow playback**: Try reducing video resolution or lowering FPS
 
+**Linux `xcb` error pointing at `cv2/qt/plugins`**: remove GUI-enabled OpenCV
+from the environment and use the headless wheel. The player GUI comes from PyQt5.
+
+```bash
+python -m pip uninstall -y opencv-python opencv-contrib-python
+python -m pip install --force-reinstall "numpy<2" "opencv-python-headless<4.12" PyQt5
+```
+
+For retraining, install the full DeepLabCut training package in the Python
+environment that launches the player. `deeplabcut-live` is only for inference
+with an exported model and does not provide `create_training_dataset`,
+`train_network`, or `evaluate_network`.
+
+The current retrainer accepts TensorFlow `snapshot*.index` source weights and
+the prediction runner uses DeepLabCut-Live. For both actions in one Python 3.10
+environment, use the mutually compatible TensorFlow stack:
+
+```bash
+python -m pip install "numpy==1.26.4" "tensorflow==2.10.0"
+python -m pip install "deeplabcut[tf]==2.3.11" "deeplabcut-live[tf]==1.1.0"
+```
+
+Do not combine `deeplabcut[tf] 3.0.0` and `deeplabcut-live[tf] 1.1.0`: their
+TensorFlow requirements do not overlap.
+
 ## Requirements
 - Python 3.7+
-- opencv-python
+- opencv-python-headless (PyQt5 provides the GUI; avoid OpenCV's conflicting Qt plugins)
 - PyQt5
 - pandas
 - numpy
