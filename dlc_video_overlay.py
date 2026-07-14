@@ -14,6 +14,7 @@ import random
 import shutil
 import subprocess
 import tempfile
+import time
 import traceback
 from hashlib import sha1
 from datetime import datetime
@@ -541,6 +542,8 @@ class VideoOverlayPlayer(QMainWindow):
         self.fps = 30
         self.total_frames = 0
         self.playback_speed = 1.0
+        self._play_started_at = None
+        self._play_started_frame = 0
         
         # Point configuration
         self.point_configs = {}  # {point_name: {'enabled': bool, 'color': (r,g,b)}}
@@ -1269,6 +1272,8 @@ class VideoOverlayPlayer(QMainWindow):
         self.speed_label.setText(f"{self.playback_speed:.1f}x")
         # Update timer interval if playing
         if self.is_playing and self.fps > 0:
+            self._play_started_at = time.perf_counter()
+            self._play_started_frame = self.current_frame
             interval = max(1, int(1000 / (self.fps * self.playback_speed)))
             self.timer.setInterval(interval)
     
@@ -3073,6 +3078,11 @@ class VideoOverlayPlayer(QMainWindow):
             cv2.circle(frame_rgb, (x_px, y_px), dot_radius, color, -1)
             cv2.circle(frame_rgb, (x_px, y_px), ring_radius, ring_color, 2 if is_dragging_this_point else 1)
             if conf_val is not None:
+                cv2.putText(
+                    frame_rgb, f"{conf_val:.2f}", (x_px + 10, y_px - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
+                )
+            if conf_val is not None:
                 point_coords_text.append(f"{point_name}: ({x_px}, {y_px}) conf={conf_val:.2f}")
             else:
                 point_coords_text.append(f"{point_name}: ({x_px}, {y_px})")
@@ -4182,11 +4192,16 @@ class VideoOverlayPlayer(QMainWindow):
             )
             cv2.circle(frame, point, 5, color, -1)
             cv2.circle(frame, point, 8 if corrected_row else 7, ring_color, 2 if corrected_row else 1)
-            if self.draw_point_names:
-                cv2.putText(frame, name, (point[0] + 10, point[1] - 10),
+            confidence = self.get_point_confidence_value_from_data(row, name)
+            label = name if self.draw_point_names else ""
+            if confidence is not None:
+                label = f"{label} {confidence:.2f}".strip()
+            if label:
+                cv2.putText(frame, label, (point[0] + 10, point[1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
             if collect_text:
-                point_coords_text.append(f"{name}: ({point[0]}, {point[1]})")
+                confidence_text = "" if confidence is None else f" conf={confidence:.2f}"
+                point_coords_text.append(f"{name}: ({point[0]}, {point[1]}){confidence_text}")
 
         corrected_row = using_rigid and not raw_fallback and bool(row.get("is_rigid", False))
         if using_rigid and not raw_fallback and len(pixels) == 3:
@@ -4229,11 +4244,18 @@ class VideoOverlayPlayer(QMainWindow):
                 )
                 cv2.circle(frame, midpoint, 5, midpoint_color, -1)
                 cv2.circle(frame, midpoint, 8 if corrected_row else 7, ring_color, 2 if corrected_row else 1)
-                if self.draw_point_names:
-                    cv2.putText(frame, "mid_ears", (midpoint[0] + 10, midpoint[1] - 10),
+                confidence = self.get_point_confidence_value_from_data(row, "mid_ears_cam")
+                label = "mid_ears" if self.draw_point_names else ""
+                if confidence is not None:
+                    label = f"{label} {confidence:.2f}".strip()
+                if label:
+                    cv2.putText(frame, label, (midpoint[0] + 10, midpoint[1] - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, midpoint_color, 1)
                 if collect_text:
-                    point_coords_text.append(f"mid_ears: ({midpoint[0]}, {midpoint[1]})")
+                    confidence_text = "" if confidence is None else f" conf={confidence:.2f}"
+                    point_coords_text.append(
+                        f"mid_ears: ({midpoint[0]}, {midpoint[1]}){confidence_text}"
+                    )
                 points_drawn += 1
         if collect_text and using_rigid:
             if raw_fallback:
@@ -4373,9 +4395,12 @@ class VideoOverlayPlayer(QMainWindow):
                                     ring_color = (255, 220, 0) if is_dragging_this_point else (255, 255, 255)
                                     cv2.circle(frame, (x_display, y_display), dot_radius, color, -1)
                                     cv2.circle(frame, (x_display, y_display), ring_radius, ring_color, 2 if is_dragging_this_point else 1)
-                                    if self.draw_point_names:
+                                    label = point_name if self.draw_point_names else ""
+                                    if conf_value is not None:
+                                        label = f"{label} {conf_value:.2f}".strip()
+                                    if label:
                                         cv2.putText(
-                                            frame, point_name, (x_display + 10, y_display - 10),
+                                            frame, label, (x_display + 10, y_display - 10),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
                                         )
                                     points_drawn += 1
@@ -4562,6 +4587,8 @@ class VideoOverlayPlayer(QMainWindow):
             
         self.is_playing = True
         self.play_btn.setText("Pause")
+        self._play_started_at = time.perf_counter()
+        self._play_started_frame = self.current_frame
         
         # Calculate timer interval based on FPS and playback speed
         interval = max(1, int(1000 / (self.fps * self.playback_speed))) if self.fps > 0 else 33
@@ -4586,12 +4613,26 @@ class VideoOverlayPlayer(QMainWindow):
         
     def next_frame(self):
         """Advance to next frame"""
-        if self.current_frame < self.total_frames - 1:
-            self.clear_drag_state()
-            self.current_frame += 1
-            self.display_frame()
-        else:
+        if self.current_frame >= self.total_frames - 1:
             self.stop_video()
+            return
+
+        elapsed = time.perf_counter() - self._play_started_at
+        target_frame = self._play_started_frame + int(elapsed * self.fps * self.playback_speed)
+        target_frame = min(target_frame, self.total_frames - 1)
+        if target_frame <= self.current_frame:
+            return
+
+        # Drop overdue frames sequentially. grab() is much cheaper than decoding,
+        # overlaying, scaling, and displaying every frame after playback falls behind.
+        for _ in range(target_frame - self.current_frame - 1):
+            if not self.cap.grab():
+                self.stop_video()
+                return
+
+        self.clear_drag_state()
+        self.current_frame = target_frame
+        self.display_frame()
             
     def skip_frames(self, num_frames: int):
         """Skip forward or backward by num_frames"""
