@@ -5,15 +5,21 @@ set -e
 
 echo "Building Mac application for DLC Video Overlay Tool..."
 
-# Check if pyinstaller is installed
-if ! command -v pyinstaller &> /dev/null
-then
-    echo "PyInstaller not found. Installing..."
-    pip install pyinstaller
+VENV_DIR=".venv-mac-build"
+PYTHON="$VENV_DIR/bin/python"
+PYINSTALLER="$VENV_DIR/bin/pyinstaller"
+
+if [ ! -x "$PYTHON" ]; then
+    python3 -m venv "$VENV_DIR"
+fi
+
+if ! "$PYTHON" -c 'import PyInstaller, PyQt5, cv2, pandas, numpy, pyarrow; assert int(numpy.__version__.split(".")[0]) < 2' 2>/dev/null; then
+    "$PYTHON" -m pip install --upgrade pip
+    "$PYTHON" -m pip install pyinstaller PyQt5 "opencv-python-headless<4.12" pandas "numpy<2" pyarrow
 fi
 
 # Create the app bundle
-pyinstaller --clean \
+"$PYINSTALLER" --clean \
     --noconfirm \
     --name "DLC Video Overlay" \
     --windowed \

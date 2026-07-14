@@ -1,6 +1,7 @@
+import numpy as np
 import pandas as pd
 
-from run_model import load_bug_trajectory
+from run_model import Kalman, load_bug_trajectory
 
 
 def test_bug_trajectory_accepts_mixed_iso_timestamp_precision(tmp_path):
@@ -19,3 +20,10 @@ def test_bug_trajectory_accepts_mixed_iso_timestamp_precision(tmp_path):
 
     assert len(trajectory) == 2
     assert trajectory["timestamp"].notna().all()
+
+
+def test_kalman_initializes_from_valid_measurement():
+    kalman = Kalman(dt=1 / 30)
+    kalman.init(12.5, -3.0)
+
+    np.testing.assert_allclose(kalman.x[:2], [12.5, -3.0])

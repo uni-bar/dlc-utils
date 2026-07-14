@@ -140,7 +140,7 @@ class Kalman:
         self.R = np.diag([0.1, 0.1])
 
     def init(self, x0, y0):
-        if not pd.isna(x0) and not pd.isna(y0):
+        if pd.isna(x0) or pd.isna(y0):
             x0, y0 = 0, 0
         self.x = np.array([x0, y0, 0, 0, 0, 0], dtype=float)
         self.is_initiated = True

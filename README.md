@@ -63,6 +63,36 @@ In the app UI, these are shown explicitly:
 - `DLC file overwritten on save: ...`
 - `Export folder: ...`
 
+## Rigid Head Correction
+
+`Apply rigid head` learns a trustworthy head triangle and runs a forward/backward
+Kalman smoother over its camera-space center, rotation, and scale. Frames with
+two trustworthy landmarks can anchor the rigid pose. The expected triangle shape
+is the robust median of complete, plausible triangles within 10 frames, so normal
+local perspective changes are not compared with one global shape. Every landmark
+with probability below 0.5 is replaced. With two reliable current landmarks the
+local rigid triangle is fitted to both; with one reliable landmark the smoothed
+Kalman pose is translated to preserve that landmark. The ear midpoint is always
+recalculated from the final ear positions. Reconstructed frames show an orange
+`RIGID KALMAN` badge that names the replaced landmarks. A problematic frame with
+no reliable current landmark or no nearby Kalman pose remains raw and shows a
+yellow `KALMAN UNRESOLVED` badge.
+
+Rigid-overlay points can be edited directly. The visible rigid position is used
+for selecting and dragging, while the committed manual label is written to the
+authoritative raw `*_cam` columns with confidence 1.0. The current rigid row and
+ear midpoint update immediately; applying rigid head again incorporates the
+manual label as trustworthy input.
+
+The correction follows the coordinate pipeline used by the editor:
+- raw video pixels: `nose_cam_x/y`, `left_ear_cam_x/y`, `right_ear_cam_x/y`
+- rigid video pixels: `rigid_nose_cam_x/y`, etc.
+- calibrated rigid coordinates: `rigid_nose_x/y`, etc., created by
+  `Reapply Calibration To Edited DLC`
+
+Raw prediction columns are retained. Use the `Raw` / `Rigid` selector to compare
+the original and corrected video overlays.
+
 ## Fine-Tune and Run Predictions
 
 After exporting corrected labels:

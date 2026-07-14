@@ -101,13 +101,17 @@ class CharucoCalibration:
         return float(result[0] / result[2]), float(result[1] / result[2])
 
 
-def calc_head_angle(row: pd.Series) -> float:
-    needed = ["nose_x", "nose_y", "left_ear_x", "left_ear_y", "right_ear_x", "right_ear_y"]
+def calc_head_angle(row: pd.Series, prefix: str = "") -> float:
+    needed = [
+        f"{prefix}nose_x", f"{prefix}nose_y",
+        f"{prefix}left_ear_x", f"{prefix}left_ear_y",
+        f"{prefix}right_ear_x", f"{prefix}right_ear_y",
+    ]
     if any(col not in row.index or pd.isna(row[col]) for col in needed):
         return np.nan
-    x_nose, y_nose = row["nose_x"], row["nose_y"]
-    x_ears = (row["right_ear_x"] + row["left_ear_x"]) / 2
-    y_ears = (row["right_ear_y"] + row["left_ear_y"]) / 2
+    x_nose, y_nose = row[f"{prefix}nose_x"], row[f"{prefix}nose_y"]
+    x_ears = (row[f"{prefix}right_ear_x"] + row[f"{prefix}left_ear_x"]) / 2
+    y_ears = (row[f"{prefix}right_ear_y"] + row[f"{prefix}left_ear_y"]) / 2
     return float(math.atan2(y_ears - y_nose, x_ears - x_nose))
 
 
@@ -273,6 +277,16 @@ def run_edited_pose_calibration_job(
 
     if {"nose_x", "nose_y", "left_ear_x", "left_ear_y", "right_ear_x", "right_ear_y"}.issubset(df.columns):
         updated_cells += set_col(df, "angle_", df.apply(calc_head_angle, axis=1))
+
+    rigid_columns = {
+        "rigid_nose_x", "rigid_nose_y",
+        "rigid_left_ear_x", "rigid_left_ear_y",
+        "rigid_right_ear_x", "rigid_right_ear_y",
+    }
+    if rigid_columns.issubset(df.columns):
+        rigid_angles = df.apply(lambda row: calc_head_angle(row, "rigid_"), axis=1)
+        updated_cells += set_col(df, "rigid_head_angle_rad", rigid_angles)
+        updated_cells += set_col(df, "rigid_head_angle_deg", np.degrees(rigid_angles))
 
     updated_cells += update_screen_columns(df, screen_start_x, screen_pix_cm, screen_y)
 

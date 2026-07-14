@@ -13,6 +13,7 @@ import math
 import random
 import shutil
 import subprocess
+import tempfile
 import traceback
 from hashlib import sha1
 from datetime import datetime
@@ -270,6 +271,27 @@ def ensure_export_log_header(export_log_path: Path):
         ])
 
 
+def copy_file_safely(source: Path, destination: Path):
+    """Copy through macOS cp when Python file handles fail on /Volumes mounts."""
+    if sys.platform == "darwin" and (
+        str(source).startswith("/Volumes/") or str(destination).startswith("/Volumes/")
+    ):
+        subprocess.run(["/bin/cp", "-f", str(source), str(destination)], check=True)
+    else:
+        shutil.copyfile(source, destination)
+
+
+def read_parquet_safely(path: str) -> pd.DataFrame:
+    """Avoid pandas/Arrow file-handle failures on macOS mounted volumes."""
+    source = Path(path)
+    if sys.platform != "darwin" or not str(source).startswith("/Volumes/"):
+        return pd.read_parquet(source)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        local_copy = Path(temp_dir) / source.name
+        copy_file_safely(source, local_copy)
+        return pd.read_parquet(local_copy)
+
+
 class SaveExportWorker(QObject):
     """Write DLC data and optional frame/label exports off the UI thread."""
 
@@ -388,23 +410,20 @@ class SaveExportWorker(QObject):
         job = self.job
         dlc_file = Path(job["dlc_path"])
         is_parquet = bool(job["is_parquet"])
-        tmp_file = (
-            dlc_file.with_name(dlc_file.name + ".tmp.parquet")
-            if is_parquet else
-            dlc_file.with_name(dlc_file.name + ".tmp.csv")
-        )
         backup_file = dlc_file.with_suffix(dlc_file.suffix + ".bak")
         created_backup = False
 
         if job["create_backup"] and dlc_file.exists() and not backup_file.exists():
-            shutil.copyfile(dlc_file, backup_file)
+            copy_file_safely(dlc_file, backup_file)
             created_backup = True
 
-        if is_parquet:
-            job["dlc_data"].to_parquet(tmp_file, index=False)
-        else:
-            job["dlc_data"].to_csv(tmp_file, index=False)
-        tmp_file.replace(dlc_file)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_file = Path(temp_dir) / dlc_file.name
+            if is_parquet:
+                job["dlc_data"].to_parquet(tmp_file, index=False)
+            else:
+                job["dlc_data"].to_csv(tmp_file, index=False)
+            copy_file_safely(tmp_file, dlc_file)
 
         processed_frames = []
         exported_count = 0
@@ -602,6 +621,7 @@ class VideoOverlayPlayer(QMainWindow):
         
         # Timer for playback
         self.timer = QTimer()
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self.next_frame)
         
         # Debounced save to keep drag edits responsive
@@ -986,7 +1006,10 @@ class VideoOverlayPlayer(QMainWindow):
         
         # Progress slider
         self.progress_slider = QSlider(Qt.Horizontal)
-        self.progress_slider.valueChanged.connect(self.seek_frame)
+        self.progress_slider.sliderPressed.connect(self.pause_video)
+        self.progress_slider.sliderMoved.connect(self.preview_slider_frame)
+        self.progress_slider.sliderReleased.connect(self.seek_slider_frame)
+        self.progress_slider.valueChanged.connect(self.on_progress_slider_changed)
         right_layout.addWidget(self.progress_slider)
 
         frame_jump_layout = QHBoxLayout()
@@ -1246,7 +1269,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.speed_label.setText(f"{self.playback_speed:.1f}x")
         # Update timer interval if playing
         if self.is_playing and self.fps > 0:
-            interval = int(1000 / (self.fps * self.playback_speed))
+            interval = max(1, int(1000 / (self.fps * self.playback_speed)))
             self.timer.setInterval(interval)
     
     def set_edit_status(self, message: str, is_error: bool = False):
@@ -1266,6 +1289,7 @@ class VideoOverlayPlayer(QMainWindow):
                 self.set_edit_status("Load video + DLC first, then enable Edit mode.", is_error=True)
                 return
             self.pause_video()
+            self.display_frame()
             self.edit_mode_btn.setText("Edit: ON")
             self.edit_mode_btn.setStyleSheet(
                 "QPushButton { background-color: #2E7D32; color: white; font-weight: bold; }"
@@ -1832,6 +1856,69 @@ class VideoOverlayPlayer(QMainWindow):
             x_raw = float(x_px)
             y_raw = float(y_px)
         return x_raw, y_raw
+
+    def rigid_edit_base_name(self, point_name: str) -> Optional[str]:
+        """Map an editable *_cam point to a rigid head landmark."""
+        if not point_name.endswith("_cam"):
+            return None
+        base_name = point_name[:-4]
+        return base_name if base_name in LANDMARKS else None
+
+    def get_edit_display_point(self, row, point_name: str) -> Tuple[Any, Any]:
+        """Return the coordinates currently shown for an editable point."""
+        base_name = self.rigid_edit_base_name(point_name)
+        if self.head_overlay_mode == "Rigid" and base_name is not None:
+            rigid_x = row.get(f"rigid_{base_name}_cam_x", np.nan)
+            rigid_y = row.get(f"rigid_{base_name}_cam_y", np.nan)
+            if pd.notna(rigid_x) and pd.notna(rigid_y):
+                return rigid_x, rigid_y
+        return row.get(f"{point_name}_x", np.nan), row.get(f"{point_name}_y", np.nan)
+
+    def sync_manual_points_to_rigid(self, row_idx: int, point_names):
+        """Keep the visible rigid row aligned with authoritative manual edits."""
+        if self.dlc_data is None or self.head_overlay_mode != "Rigid":
+            return
+
+        changed_bases = []
+        for point_name in point_names:
+            base_name = self.rigid_edit_base_name(point_name)
+            if base_name is None:
+                continue
+            raw_x = f"{point_name}_x"
+            raw_y = f"{point_name}_y"
+            rigid_x = f"rigid_{base_name}_cam_x"
+            rigid_y = f"rigid_{base_name}_cam_y"
+            if rigid_x not in self.dlc_data.columns or rigid_y not in self.dlc_data.columns:
+                continue
+            self.set_cell_value(row_idx, rigid_x, self.get_cell_value(row_idx, raw_x))
+            self.set_cell_value(row_idx, rigid_y, self.get_cell_value(row_idx, raw_y))
+            changed_bases.append(base_name)
+
+        if not changed_bases:
+            return
+
+        left = np.array([
+            self.get_cell_value(row_idx, "rigid_left_ear_cam_x"),
+            self.get_cell_value(row_idx, "rigid_left_ear_cam_y"),
+        ], dtype=float)
+        right = np.array([
+            self.get_cell_value(row_idx, "rigid_right_ear_cam_x"),
+            self.get_cell_value(row_idx, "rigid_right_ear_cam_y"),
+        ], dtype=float)
+        nose = np.array([
+            self.get_cell_value(row_idx, "rigid_nose_cam_x"),
+            self.get_cell_value(row_idx, "rigid_nose_cam_y"),
+        ], dtype=float)
+        midpoint = (left + right) / 2.0
+        self.set_cell_value(row_idx, "rigid_mid_ears_cam_x", midpoint[0])
+        self.set_cell_value(row_idx, "rigid_mid_ears_cam_y", midpoint[1])
+        if np.isfinite(np.concatenate([nose, midpoint])).all():
+            angle = math.atan2(nose[1] - midpoint[1], nose[0] - midpoint[0])
+            self.set_cell_value(row_idx, "rigid_head_cam_angle_rad", angle)
+            self.set_cell_value(row_idx, "rigid_head_cam_angle_deg", math.degrees(angle))
+        self.set_cell_value(row_idx, "rigid_method", "manual_edit")
+        self.set_cell_value(row_idx, "rigid_changed_points", ", ".join(changed_bases))
+        self.set_cell_value(row_idx, "is_rigid", False)
     
     def _column_index(self, col_name: str) -> Optional[int]:
         """Resolve a column name to a stable integer index."""
@@ -2014,14 +2101,11 @@ class VideoOverlayPlayer(QMainWindow):
         for point_name, config in self.point_configs.items():
             if point_name not in self.editable_point_names:
                 continue
+            if self.head_overlay_mode == "Rigid" and self.rigid_edit_base_name(point_name) is None:
+                continue
             if not config.get("enabled", True):
                 continue
-            x_col = f"{point_name}_x"
-            y_col = f"{point_name}_y"
-            if x_col not in self.dlc_data.columns or y_col not in self.dlc_data.columns:
-                continue
-            x_val = row[x_col]
-            y_val = row[y_col]
+            x_val, y_val = self.get_edit_display_point(row, point_name)
             if pd.isna(x_val) or pd.isna(y_val):
                 continue
             
@@ -2043,12 +2127,9 @@ class VideoOverlayPlayer(QMainWindow):
         row = self.dlc_data.iloc[int(dlc_row_idx)]
         points_raw = {}
         for point_name in sorted(self.editable_point_names):
-            x_col = f"{point_name}_x"
-            y_col = f"{point_name}_y"
-            if x_col not in self.dlc_data.columns or y_col not in self.dlc_data.columns:
+            if self.head_overlay_mode == "Rigid" and self.rigid_edit_base_name(point_name) is None:
                 continue
-            x_val = row[x_col]
-            y_val = row[y_col]
+            x_val, y_val = self.get_edit_display_point(row, point_name)
             if pd.isna(x_val) or pd.isna(y_val):
                 continue
             try:
@@ -2151,6 +2232,7 @@ class VideoOverlayPlayer(QMainWindow):
             self.set_points_confidence_for_rows(
                 [int(dlc_row_idx)], rotated_point_names, self.manual_edit_confidence
             )
+            self.sync_manual_points_to_rigid(dlc_row_idx, rotated_point_names)
             self.drag_preview_raw = None
             self.drag_preview_points_raw = {}
 
@@ -2205,6 +2287,7 @@ class VideoOverlayPlayer(QMainWindow):
             self.set_points_confidence_for_rows(
                 [int(dlc_row_idx)], moved_point_names, self.manual_edit_confidence
             )
+            self.sync_manual_points_to_rigid(dlc_row_idx, moved_point_names)
             self.drag_preview_raw = None
             self.drag_preview_points_raw = {}
 
@@ -2243,6 +2326,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.set_points_confidence_for_rows(
             [int(dlc_row_idx)], [point_name], self.manual_edit_confidence
         )
+        self.sync_manual_points_to_rigid(dlc_row_idx, [point_name])
         self.drag_preview_raw = None
         
         # Reset cached row so display uses latest values immediately.
@@ -2437,6 +2521,7 @@ class VideoOverlayPlayer(QMainWindow):
             
             # Best effort confidence cleanup for no-head frames.
             self.set_points_confidence_for_rows([int(dlc_row_idx)], [point_name], 0.0)
+        self.sync_manual_points_to_rigid(dlc_row_idx, self.editable_point_names)
         
         self._last_dlc_row_idx = None
         self.drag_preview_raw = None
@@ -2478,6 +2563,7 @@ class VideoOverlayPlayer(QMainWindow):
             self.set_cell_value(dlc_row_idx, y_col, np.nan)
             changed = True
         self.set_points_confidence_for_rows([int(dlc_row_idx)], [point_name], 0.0)
+        self.sync_manual_points_to_rigid(dlc_row_idx, [point_name])
 
         if not changed:
             self.set_edit_status(f"Missing x/y columns for point '{point_name}'.", is_error=True)
@@ -2532,6 +2618,7 @@ class VideoOverlayPlayer(QMainWindow):
         conf_updates = self.set_points_confidence_for_rows(
             [int(dlc_row_idx)], [left_point, right_point], self.manual_edit_confidence
         )
+        self.sync_manual_points_to_rigid(dlc_row_idx, [left_point, right_point])
 
         self._last_dlc_row_idx = None
         self.drag_preview_raw = None
@@ -2603,6 +2690,8 @@ class VideoOverlayPlayer(QMainWindow):
         conf_updates = self.set_points_confidence_for_rows(
             sorted(row_to_frames.keys()), [left_point, right_point], self.manual_edit_confidence
         )
+        for row_idx in row_to_frames:
+            self.sync_manual_points_to_rigid(row_idx, [left_point, right_point])
 
         self._last_dlc_row_idx = None
         self.drag_preview_raw = None
@@ -2756,6 +2845,8 @@ class VideoOverlayPlayer(QMainWindow):
         self.set_points_confidence_for_rows(
             unique_target_rows, self.editable_point_names, self.manual_edit_confidence
         )
+        for row_idx in unique_target_rows:
+            self.sync_manual_points_to_rigid(row_idx, self.editable_point_names)
 
         self._last_dlc_row_idx = None
         self.drag_preview_raw = None
@@ -2935,6 +3026,7 @@ class VideoOverlayPlayer(QMainWindow):
         candidate_points = [
             pn for pn in self.point_configs.keys()
             if pn in self.editable_point_names and self.point_configs[pn].get("enabled", True)
+            and (self.head_overlay_mode != "Rigid" or self.rigid_edit_base_name(pn) is not None)
         ]
         
         for point_name in candidate_points:
@@ -2942,13 +3034,7 @@ class VideoOverlayPlayer(QMainWindow):
             if not config:
                 continue
             
-            x_col = f"{point_name}_x"
-            y_col = f"{point_name}_y"
-            if x_col not in self.dlc_data.columns or y_col not in self.dlc_data.columns:
-                continue
-            
-            x_val = row[x_col]
-            y_val = row[y_col]
+            x_val, y_val = self.get_edit_display_point(row, point_name)
             if (
                 self.dragging_dlc_row_idx == dlc_row_idx
                 and point_name in self.drag_preview_points_raw
@@ -3741,7 +3827,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.dlc_save_path_label.setText(f"DLC file overwritten on save: {self.dlc_path}")
         try:
             if dlc_path.endswith('.parquet'):
-                self.dlc_data = pd.read_parquet(dlc_path)
+                self.dlc_data = read_parquet_safely(dlc_path)
             else:
                 self.dlc_data = pd.read_csv(dlc_path)
             
@@ -3795,7 +3881,7 @@ class VideoOverlayPlayer(QMainWindow):
         if annotation_path:
             try:
                 if annotation_path.endswith('.parquet'):
-                    self.annotation_data = pd.read_parquet(annotation_path)
+                    self.annotation_data = read_parquet_safely(annotation_path)
                 elif annotation_path.endswith('.csv'):
                     self.annotation_data = pd.read_csv(annotation_path)
                 elif annotation_path.endswith('.json'):
@@ -4001,7 +4087,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.apply_rigid_head_btn.setEnabled(False)
         self.apply_rigid_head_btn.setText("Applying rigid head...")
         QApplication.processEvents()
-        raw_columns = [f"{name}_{axis}" for name in LANDMARKS for axis in ("x", "y")]
+        raw_columns = [f"{name}_cam_{axis}" for name in LANDMARKS for axis in ("x", "y")]
         try:
             raw_before = self.dlc_data[raw_columns].copy(deep=True)
             corrected = add_rigid_head_correction(self.dlc_data)
@@ -4017,9 +4103,8 @@ class VideoOverlayPlayer(QMainWindow):
                 "Rigid head correction applied: "
                 f"{summary['total_rows']} total rows, "
                 f"{summary['corrected_rows']} corrected rows, "
-                f"{summary['raw_valid_rows']} raw-valid rows, "
+                f"{summary['unresolved_rows']} unresolved candidates, "
                 f"{summary['unavailable_rows']} unavailable rows; "
-                f"{summary['carried_rows']} carried; "
                 f"{summary['corrected_trials']} trials corrected. "
                 "Not saved yet; click Save Edits Now to persist the new columns."
             )
@@ -4049,7 +4134,7 @@ class VideoOverlayPlayer(QMainWindow):
 
     def draw_head_overlay(self, frame: np.ndarray, row: Dict[str, Any], collect_text: bool,
                           point_coords_text: Optional[List[str]]) -> int:
-        """Draw the calibrated raw or rigid head triangle for one dataframe row."""
+        """Draw the raw or rigid camera-coordinate head triangle."""
         mapping, available = head_overlay_columns(self.head_overlay_mode, row.keys())
         if not available:
             return 0
@@ -4060,6 +4145,7 @@ class VideoOverlayPlayer(QMainWindow):
         }
         rigid_available = all(pd.notna(x) and pd.notna(y) for x, y in values.values())
         raw_fallback = using_rigid and not rigid_available
+        unresolved_row = using_rigid and str(row.get("rigid_method", "")) == "kalman_unresolved"
         if raw_fallback:
             mapping, available = head_overlay_columns("Raw", row.keys())
             if not available:
@@ -4089,7 +4175,11 @@ class VideoOverlayPlayer(QMainWindow):
             pixels[name] = point
             color = config.get("color", (0, 255, 255))
             corrected_row = using_rigid and not raw_fallback and bool(row.get("is_rigid", False))
-            ring_color = (255, 128, 0) if corrected_row else (255, 255, 255)
+            ring_color = (
+                (255, 128, 0) if corrected_row
+                else (255, 215, 0) if unresolved_row
+                else (255, 255, 255)
+            )
             cv2.circle(frame, point, 5, color, -1)
             cv2.circle(frame, point, 8 if corrected_row else 7, ring_color, 2 if corrected_row else 1)
             if self.draw_point_names:
@@ -4098,22 +4188,63 @@ class VideoOverlayPlayer(QMainWindow):
             if collect_text:
                 point_coords_text.append(f"{name}: ({point[0]}, {point[1]})")
 
+        corrected_row = using_rigid and not raw_fallback and bool(row.get("is_rigid", False))
         if using_rigid and not raw_fallback and len(pixels) == 3:
-            corrected_row = bool(row.get("is_rigid", False))
-            line_color = (255, 128, 0) if corrected_row else (220, 220, 220)
+            line_color = (
+                (255, 128, 0) if corrected_row
+                else (255, 215, 0) if unresolved_row
+                else (220, 220, 220)
+            )
             width = 2 if corrected_row else 1
             cv2.line(frame, pixels["left_ear"], pixels["right_ear"], line_color, width)
             cv2.line(frame, pixels["left_ear"], pixels["nose"], line_color, width)
             cv2.line(frame, pixels["right_ear"], pixels["nose"], line_color, width)
+        if corrected_row:
+            changed = str(row.get("rigid_changed_points", "")).strip()
+            label = f"RIGID KALMAN: {changed.upper()}" if changed else "RIGID KALMAN"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text_size, _ = cv2.getTextSize(label, font, 0.6, 2)
+            cv2.rectangle(frame, (12, 12), (28 + text_size[0], 42), (255, 128, 0), -1)
+            cv2.putText(frame, label, (20, 34), font, 0.6, (0, 0, 0), 2)
+        elif unresolved_row:
+            label = "KALMAN UNRESOLVED"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text_size, _ = cv2.getTextSize(label, font, 0.6, 2)
+            cv2.rectangle(frame, (12, 12), (28 + text_size[0], 42), (255, 215, 0), -1)
+            cv2.putText(frame, label, (20, 34), font, 0.6, (0, 0, 0), 2)
+        points_drawn = len(pixels)
+        if using_rigid and "left_ear" in pixels and "right_ear" in pixels:
+            midpoint_config = self.point_configs.get("mid_ears_cam", {})
+            if midpoint_config.get("enabled", True):
+                midpoint = (
+                    int(round((pixels["left_ear"][0] + pixels["right_ear"][0]) / 2)),
+                    int(round((pixels["left_ear"][1] + pixels["right_ear"][1]) / 2)),
+                )
+                midpoint_color = midpoint_config.get("color", (0, 255, 0))
+                corrected_row = not raw_fallback and bool(row.get("is_rigid", False))
+                ring_color = (
+                    (255, 128, 0) if corrected_row
+                    else (255, 215, 0) if unresolved_row
+                    else (255, 255, 255)
+                )
+                cv2.circle(frame, midpoint, 5, midpoint_color, -1)
+                cv2.circle(frame, midpoint, 8 if corrected_row else 7, ring_color, 2 if corrected_row else 1)
+                if self.draw_point_names:
+                    cv2.putText(frame, "mid_ears", (midpoint[0] + 10, midpoint[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, midpoint_color, 1)
+                if collect_text:
+                    point_coords_text.append(f"mid_ears: ({midpoint[0]}, {midpoint[1]})")
+                points_drawn += 1
         if collect_text and using_rigid:
             if raw_fallback:
                 point_coords_text.append("rigid: unavailable (raw fallback)")
             else:
                 point_coords_text.append(
                     f"rigid_method: {row.get('rigid_method', 'unavailable')} | "
-                    f"is_rigid: {bool(row.get('is_rigid', False))}"
+                    f"is_rigid: {bool(row.get('is_rigid', False))} | "
+                    f"changed: {row.get('rigid_changed_points', '') or '-'}"
                 )
-        return len(pixels)
+        return points_drawn
         
     def display_frame(self):
         """Display current frame with overlays"""
@@ -4133,13 +4264,14 @@ class VideoOverlayPlayer(QMainWindow):
                 self.pause_video()  # Just pause, don't call stop_video to avoid recursion
                 return
                 
-            # Keep an unmodified frame for export when manual edits happen.
-            self._last_rendered_bgr = frame.copy()
+            # cvtColor creates a new array, so the decoded BGR frame can be
+            # retained directly for a later manual-label export.
+            self._last_rendered_bgr = frame
             self._last_rendered_frame_size = (frame.shape[1], frame.shape[0])
             
             # Convert BGR to RGB
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            self._last_rendered_rgb_base = frame.copy()
+            self._last_rendered_rgb_base = frame.copy() if self.edit_mode else None
         
             points_drawn = 0
             collect_coords_text = (not self.is_playing) or self.edit_mode
@@ -4179,7 +4311,7 @@ class VideoOverlayPlayer(QMainWindow):
                     use_rigid_head_overlay = self.head_overlay_mode == "Rigid"
                     for point_name, config in self.point_configs.items():
                         base_point_name = point_name[:-4] if point_name.endswith("_cam") else point_name
-                        if use_rigid_head_overlay and base_point_name in LANDMARKS:
+                        if use_rigid_head_overlay and base_point_name in (*LANDMARKS, "mid_ears"):
                             continue
                         # Check if point is enabled
                         if not config.get('enabled', True):
@@ -4432,7 +4564,7 @@ class VideoOverlayPlayer(QMainWindow):
         self.play_btn.setText("Pause")
         
         # Calculate timer interval based on FPS and playback speed
-        interval = int(1000 / (self.fps * self.playback_speed)) if self.fps > 0 else 33
+        interval = max(1, int(1000 / (self.fps * self.playback_speed))) if self.fps > 0 else 33
         self.timer.start(interval)
         
     def pause_video(self):
@@ -4475,6 +4607,21 @@ class VideoOverlayPlayer(QMainWindow):
             self.clear_drag_state()
             self.current_frame = frame_num
             self.display_frame()
+
+    def preview_slider_frame(self, frame_num: int):
+        """Update lightweight controls while dragging without decoding video."""
+        self.frame_number_spin.blockSignals(True)
+        self.frame_number_spin.setValue(int(frame_num))
+        self.frame_number_spin.blockSignals(False)
+
+    def seek_slider_frame(self):
+        """Decode once when the user releases the timeline slider."""
+        self.seek_frame(self.progress_slider.value())
+
+    def on_progress_slider_changed(self, frame_num: int):
+        """Support keyboard/groove changes while debouncing slider drags."""
+        if not self.progress_slider.isSliderDown():
+            self.seek_frame(int(frame_num))
 
     def go_to_frame_number(self):
         """Jump directly to the frame entered in the frame-number control."""
