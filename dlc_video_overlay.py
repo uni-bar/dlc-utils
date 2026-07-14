@@ -3078,11 +3078,6 @@ class VideoOverlayPlayer(QMainWindow):
             cv2.circle(frame_rgb, (x_px, y_px), dot_radius, color, -1)
             cv2.circle(frame_rgb, (x_px, y_px), ring_radius, ring_color, 2 if is_dragging_this_point else 1)
             if conf_val is not None:
-                cv2.putText(
-                    frame_rgb, f"{conf_val:.2f}", (x_px + 10, y_px - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
-                )
-            if conf_val is not None:
                 point_coords_text.append(f"{point_name}: ({x_px}, {y_px}) conf={conf_val:.2f}")
             else:
                 point_coords_text.append(f"{point_name}: ({x_px}, {y_px})")
@@ -4193,11 +4188,8 @@ class VideoOverlayPlayer(QMainWindow):
             cv2.circle(frame, point, 5, color, -1)
             cv2.circle(frame, point, 8 if corrected_row else 7, ring_color, 2 if corrected_row else 1)
             confidence = self.get_point_confidence_value_from_data(row, name)
-            label = name if self.draw_point_names else ""
-            if confidence is not None:
-                label = f"{label} {confidence:.2f}".strip()
-            if label:
-                cv2.putText(frame, label, (point[0] + 10, point[1] - 10),
+            if self.draw_point_names:
+                cv2.putText(frame, name, (point[0] + 10, point[1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
             if collect_text:
                 confidence_text = "" if confidence is None else f" conf={confidence:.2f}"
@@ -4245,11 +4237,8 @@ class VideoOverlayPlayer(QMainWindow):
                 cv2.circle(frame, midpoint, 5, midpoint_color, -1)
                 cv2.circle(frame, midpoint, 8 if corrected_row else 7, ring_color, 2 if corrected_row else 1)
                 confidence = self.get_point_confidence_value_from_data(row, "mid_ears_cam")
-                label = "mid_ears" if self.draw_point_names else ""
-                if confidence is not None:
-                    label = f"{label} {confidence:.2f}".strip()
-                if label:
-                    cv2.putText(frame, label, (midpoint[0] + 10, midpoint[1] - 10),
+                if self.draw_point_names:
+                    cv2.putText(frame, "mid_ears", (midpoint[0] + 10, midpoint[1] - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, midpoint_color, 1)
                 if collect_text:
                     confidence_text = "" if confidence is None else f" conf={confidence:.2f}"
@@ -4296,8 +4285,8 @@ class VideoOverlayPlayer(QMainWindow):
             self._last_rendered_rgb_base = frame.copy() if self.edit_mode else None
         
             points_drawn = 0
-            collect_coords_text = (not self.is_playing) or self.edit_mode
-            point_coords_text = [] if collect_coords_text else None
+            collect_coords_text = True
+            point_coords_text = []
         
             # Draw DLC points
             if self.dlc_data is not None and len(self.point_configs) > 0:
@@ -4395,12 +4384,9 @@ class VideoOverlayPlayer(QMainWindow):
                                     ring_color = (255, 220, 0) if is_dragging_this_point else (255, 255, 255)
                                     cv2.circle(frame, (x_display, y_display), dot_radius, color, -1)
                                     cv2.circle(frame, (x_display, y_display), ring_radius, ring_color, 2 if is_dragging_this_point else 1)
-                                    label = point_name if self.draw_point_names else ""
-                                    if conf_value is not None:
-                                        label = f"{label} {conf_value:.2f}".strip()
-                                    if label:
+                                    if self.draw_point_names:
                                         cv2.putText(
-                                            frame, label, (x_display + 10, y_display - 10),
+                                            frame, point_name, (x_display + 10, y_display - 10),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
                                         )
                                     points_drawn += 1
@@ -4479,15 +4465,10 @@ class VideoOverlayPlayer(QMainWindow):
             )
             
             # Update point coordinates display
-            if collect_coords_text:
-                if point_coords_text:
-                    self.coords_label.setText("Point Coordinates:\n" + "\n".join(point_coords_text))
-                else:
-                    self.coords_label.setText("Point Coordinates: No points visible")
+            if point_coords_text:
+                self.coords_label.setText("Point Coordinates:\n" + "\n".join(point_coords_text))
             else:
-                playing_msg = "Point Coordinates: playing (pause for per-point details)"
-                if self.coords_label.text() != playing_msg:
-                    self.coords_label.setText(playing_msg)
+                self.coords_label.setText("Point Coordinates: No points visible")
             
             # Update slider without triggering signal
             self.progress_slider.blockSignals(True)
