@@ -1917,6 +1917,21 @@ class VideoOverlayPlayer(QMainWindow):
         midpoint = (left + right) / 2.0
         self.set_cell_value(row_idx, "rigid_mid_ears_cam_x", midpoint[0])
         self.set_cell_value(row_idx, "rigid_mid_ears_cam_y", midpoint[1])
+        ear_vector = right - left
+        ear_width = float(np.linalg.norm(ear_vector))
+        if ear_width > 0 and np.isfinite(np.concatenate([nose, left, right])).all():
+            ear_axis = ear_vector / ear_width
+            forward_axis = np.array([-ear_axis[1], ear_axis[0]])
+            nose_vector = nose - midpoint
+            self.set_cell_value(row_idx, "rigid_ear_width_cam", ear_width)
+            self.set_cell_value(
+                row_idx, "rigid_q_forward",
+                float(np.dot(nose_vector, forward_axis) / ear_width),
+            )
+            self.set_cell_value(
+                row_idx, "rigid_q_side",
+                float(np.dot(nose_vector, ear_axis) / ear_width),
+            )
         if np.isfinite(np.concatenate([nose, midpoint])).all():
             angle = math.atan2(nose[1] - midpoint[1], nose[0] - midpoint[0])
             self.set_cell_value(row_idx, "rigid_head_cam_angle_rad", angle)
@@ -3531,15 +3546,18 @@ class VideoOverlayPlayer(QMainWindow):
         self.launch_model_process(cmd, labels_pool_root, "retrain")
 
     def start_prediction(self):
-        """Run the selected prediction model on the currently loaded video."""
+        """Run the selected prediction model on the current video."""
         if self.retrain_process is not None and self.retrain_process.poll() is None:
             self.set_retrain_status("A model action is already running.", is_error=True)
             return
         if self._calibration_in_progress:
             self.set_retrain_status("Calibration is already running.", is_error=True)
             return
-        if self.video_path is None:
-            self.set_retrain_status("Load the target video first.", is_error=True)
+
+        video_path_text = self.video_input.text().strip()
+        video_path = Path(video_path_text).expanduser() if video_path_text else Path()
+        if not video_path_text or not video_path.is_file():
+            self.set_retrain_status("Select a valid target video first.", is_error=True)
             return
 
         model_path_text = self.prediction_model_path_input.text().strip()
@@ -3563,7 +3581,7 @@ class VideoOverlayPlayer(QMainWindow):
         cmd = [
             sys.executable, str(self.prediction_script),
             "--model_path", str(model_path.resolve()),
-            "--video_path", str(self.video_path),
+            "--video_path", str(video_path.resolve()),
             "--cam_name", self.retrain_cam_name_input.text().strip() or "top",
             "--calib_dir", str(calibration_dir),
             "--no_skip_existing",
@@ -4208,7 +4226,12 @@ class VideoOverlayPlayer(QMainWindow):
             cv2.line(frame, pixels["right_ear"], pixels["nose"], line_color, width)
         if corrected_row:
             changed = str(row.get("rigid_changed_points", "")).strip()
-            label = f"RIGID KALMAN: {changed.upper()}" if changed else "RIGID KALMAN"
+            prefix = (
+                "RIGID KALMAN (NO ANCHOR)"
+                if str(row.get("rigid_method", "")) == "kalman_no_anchor"
+                else "RIGID KALMAN"
+            )
+            label = f"{prefix}: {changed.upper()}" if changed else prefix
             font = cv2.FONT_HERSHEY_SIMPLEX
             text_size, _ = cv2.getTextSize(label, font, 0.6, 2)
             cv2.rectangle(frame, (12, 12), (28 + text_size[0], 42), (255, 128, 0), -1)

@@ -567,6 +567,7 @@ def main():
     saved_or_existing = 0
     skipped_or_failed = 0
     for video in videos:
+        print(f"Inferring video: {video}", flush=True)
         runner.is_initialized = False
         try:
             result = runner.predict_video(video, skip_existing=args.skip_existing)

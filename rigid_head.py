@@ -16,6 +16,9 @@ RIGID_CAMERA_COLUMNS = [
 RIGID_DIAGNOSTIC_COLUMNS = [
     "rigid_head_cam_angle_rad",
     "rigid_head_cam_angle_deg",
+    "rigid_ear_width_cam",
+    "rigid_q_forward",
+    "rigid_q_side",
     "rigid_method",
     "rigid_fit_error",
     "rigid_n_observations",
@@ -37,8 +40,8 @@ STALE_RIGID_COLUMNS = RIGID_COLUMNS + [
 
 @dataclass
 class RigidHeadConfig:
-    confidence_threshold: float = 0.8
-    correction_confidence_threshold: float = 0.5
+    confidence_threshold: float = 0.5
+    shape_confidence_threshold: float = 0.8
     window_radius: int = 10
     seed_shape_error: float = 0.5
     suspicious_shape_error: float = 0.15
@@ -88,15 +91,23 @@ def _shape_signature(points: np.ndarray) -> np.ndarray:
     return sides / mean_side
 
 
-def _normalized_triangle(points: np.ndarray) -> np.ndarray:
-    ear_midpoint = (points[1] + points[2]) / 2.0
-    direction = points[0] - ear_midpoint
-    length = np.linalg.norm(direction)
-    if length == 0 or np.linalg.norm(points[1] - points[2]) == 0:
+def _state_from_triangle(points: np.ndarray) -> np.ndarray:
+    """Return center, ear angle/width, and the two intrinsic shape coordinates."""
+    midpoint = (points[1] + points[2]) / 2.0
+    ear_vector = points[2] - points[1]
+    ear_width = np.linalg.norm(ear_vector)
+    if ear_width == 0:
         raise ValueError("Degenerate head triangle")
-    direction /= length
-    perpendicular = np.array([-direction[1], direction[0]])
-    return (points - ear_midpoint) @ np.column_stack([direction, perpendicular])
+    ear_axis = ear_vector / ear_width
+    forward_axis = np.array([-ear_axis[1], ear_axis[0]])
+    nose_vector = points[0] - midpoint
+    q_forward = np.dot(nose_vector, forward_axis) / ear_width
+    q_side = np.dot(nose_vector, ear_axis) / ear_width
+    ear_angle = np.arctan2(ear_axis[1], ear_axis[0])
+    return np.array([
+        midpoint[0], midpoint[1], ear_angle, np.log(ear_width),
+        q_forward, q_side,
+    ])
 
 
 def _fit_similarity(template: np.ndarray, observed: np.ndarray,
@@ -153,22 +164,30 @@ def _trusted_seed_mask(points: np.ndarray, confident: np.ndarray,
         )
         error = np.max(np.abs(signatures[position] / reference - 1.0))
         seed[position] = error <= config.seed_shape_error
+
+    seed_positions = np.flatnonzero(seed)
+    if len(seed_positions):
+        q_forward = np.array([
+            _state_from_triangle(points[position])[4]
+            for position in seed_positions
+        ])
+        expected_sign = np.sign(np.median(q_forward))
+        seed[seed_positions[q_forward * expected_sign <= 0]] = False
     return seed
 
 
-def _pose_from_triangle(template: np.ndarray, points: np.ndarray) -> np.ndarray:
-    midpoint = (points[1] + points[2]) / 2.0
-    scale = _side_lengths(points).mean() / _side_lengths(template).mean()
-    return np.array([midpoint[0], midpoint[1], _head_angle(points), np.log(scale)])
-
-
-def _triangle_from_pose(template: np.ndarray, pose: np.ndarray) -> np.ndarray:
-    angle = pose[2]
-    rotation = np.array([
-        [np.cos(angle), np.sin(angle)],
-        [-np.sin(angle), np.cos(angle)],
-    ])
-    return np.exp(pose[3]) * template @ rotation + pose[:2]
+def _triangle_from_state(state: np.ndarray) -> np.ndarray:
+    midpoint = state[:2]
+    ear_angle = state[2]
+    ear_width = np.exp(state[3])
+    ear_axis = np.array([np.cos(ear_angle), np.sin(ear_angle)])
+    forward_axis = np.array([-ear_axis[1], ear_axis[0]])
+    nose = midpoint + ear_width * (
+        state[5] * ear_axis + state[4] * forward_axis
+    )
+    left_ear = midpoint - 0.5 * ear_width * ear_axis
+    right_ear = midpoint + 0.5 * ear_width * ear_axis
+    return np.stack([nose, left_ear, right_ear])
 
 
 def _kalman_smooth(values: np.ndarray, process_variance: float,
@@ -224,7 +243,43 @@ def _kalman_smooth(values: np.ndarray, process_variance: float,
     return smoothed
 
 
-def _smooth_pose_measurements(measurements: np.ndarray) -> np.ndarray:
+def _random_walk_smooth(values: np.ndarray, process_variance: float,
+                        measurement_variance: float) -> np.ndarray:
+    """Kalman/RTS smoother for quantities that change without persistent velocity."""
+    values = np.asarray(values, dtype=float)
+    valid = np.flatnonzero(np.isfinite(values))
+    result = np.full(len(values), np.nan)
+    if not len(valid):
+        return result
+
+    start, stop = valid[0], valid[-1]
+    filtered = np.full(len(values), np.nan)
+    filtered_variance = np.full(len(values), np.nan)
+    predicted_variance = np.full(len(values), np.nan)
+    state = values[start]
+    variance = measurement_variance
+    for position in range(start, stop + 1):
+        if position > start:
+            variance += process_variance
+        predicted_variance[position] = variance
+        if np.isfinite(values[position]):
+            gain = variance / (variance + measurement_variance)
+            state += gain * (values[position] - state)
+            variance *= 1.0 - gain
+        filtered[position] = state
+        filtered_variance[position] = variance
+
+    smoothed = filtered.copy()
+    for position in range(stop - 1, start - 1, -1):
+        gain = filtered_variance[position] / predicted_variance[position + 1]
+        smoothed[position] += gain * (
+            smoothed[position + 1] - filtered[position]
+        )
+    result[start:stop + 1] = smoothed[start:stop + 1]
+    return result
+
+
+def _smooth_state_measurements(measurements: np.ndarray) -> np.ndarray:
     result = np.full_like(measurements, np.nan)
     result[:, 0] = _kalman_smooth(measurements[:, 0], 1.0, 4.0)
     result[:, 1] = _kalman_smooth(measurements[:, 1], 1.0, 4.0)
@@ -234,7 +289,9 @@ def _smooth_pose_measurements(measurements: np.ndarray) -> np.ndarray:
     if len(valid_angles):
         angles[valid_angles] = np.unwrap(angles[valid_angles])
     result[:, 2] = _kalman_smooth(angles, 0.0025, 0.01)
-    result[:, 3] = _kalman_smooth(measurements[:, 3], 0.0004, 0.0025)
+    result[:, 3] = _random_walk_smooth(measurements[:, 3], 0.0004, 0.0025)
+    result[:, 4] = _random_walk_smooth(measurements[:, 4], 0.0004, 0.0025)
+    result[:, 5] = _random_walk_smooth(measurements[:, 5], 0.0004, 0.0025)
     return result
 
 
@@ -243,6 +300,7 @@ def _write_output(output: Dict[str, np.ndarray], position: int, points: np.ndarr
                   changed_points: str = ""):
     midpoint = (points[1] + points[2]) / 2.0
     angle = _head_angle(points)
+    state = _state_from_triangle(points)
     for point_index, name in enumerate(LANDMARKS):
         output[f"rigid_{name}_cam_x"][position] = points[point_index, 0]
         output[f"rigid_{name}_cam_y"][position] = points[point_index, 1]
@@ -250,6 +308,9 @@ def _write_output(output: Dict[str, np.ndarray], position: int, points: np.ndarr
     output["rigid_mid_ears_cam_y"][position] = midpoint[1]
     output["rigid_head_cam_angle_rad"][position] = angle
     output["rigid_head_cam_angle_deg"][position] = np.degrees(angle)
+    output["rigid_ear_width_cam"][position] = np.exp(state[3])
+    output["rigid_q_forward"][position] = state[4]
+    output["rigid_q_side"][position] = state[5]
     output["rigid_method"][position] = method
     output["rigid_fit_error"][position] = fit_error
     output["rigid_n_observations"][position] = n_observations
@@ -259,7 +320,7 @@ def _write_output(output: Dict[str, np.ndarray], position: int, points: np.ndarr
 
 def add_rigid_head_correction(trajectories_df: pd.DataFrame,
                               config: RigidHeadConfig = None) -> pd.DataFrame:
-    """Correct suspicious frames using trustworthy frames within a ±10 window."""
+    """Smooth explicit pose/shape state and reconstruct suspicious frames."""
     config = config or RigidHeadConfig()
     required = [f"{name}_cam_{axis}" for name in LANDMARKS for axis in ("x", "y")]
     missing = [column for column in required if column not in trajectories_df.columns]
@@ -272,7 +333,9 @@ def add_rigid_head_correction(trajectories_df: pd.DataFrame,
     result = trajectories_df.drop(columns=STALE_RIGID_COLUMNS, errors="ignore").copy()
     output = {}
     for column in RIGID_CAMERA_COLUMNS + [
-        "rigid_head_cam_angle_rad", "rigid_head_cam_angle_deg", "rigid_fit_error"
+        "rigid_head_cam_angle_rad", "rigid_head_cam_angle_deg",
+        "rigid_ear_width_cam", "rigid_q_forward", "rigid_q_side",
+        "rigid_fit_error",
     ]:
         output[column] = np.full(len(result), np.nan)
     output["rigid_method"] = np.full(len(result), "unavailable", dtype=object)
@@ -302,69 +365,61 @@ def add_rigid_head_correction(trajectories_df: pd.DataFrame,
         confidence_values = group[
             [confidence_columns[name] for name in LANDMARKS]
         ].apply(pd.to_numeric, errors="coerce").to_numpy()
-        confident = finite & (confidence_values >= config.confidence_threshold)
-        usable = finite & (
-            confidence_values >= config.correction_confidence_threshold
+        usable = finite & (confidence_values >= config.confidence_threshold)
+        shape_confident = finite & (
+            confidence_values >= config.shape_confidence_threshold
         )
         low_probability = finite & (
-            confidence_values < config.correction_confidence_threshold
+            confidence_values < config.confidence_threshold
         )
 
-        seed = _trusted_seed_mask(points, confident, config)
+        seed = _trusted_seed_mask(points, shape_confident, config)
         trusted_frames += int(seed.sum())
         group_indices = list(group.index)
         result_positions = result.index.get_indexer(group.index)
         if not seed.any():
             continue
 
-        template = np.median(
-            np.stack([_normalized_triangle(points[i]) for i in np.flatnonzero(seed)]),
-            axis=0,
+        state_measurements = np.full((len(group), 6), np.nan)
+        trusted_shape_states = np.stack([
+            _state_from_triangle(points[position])
+            for position in np.flatnonzero(seed)
+        ])
+        shape_center = np.median(trusted_shape_states[:, 4:], axis=0)
+        shape_spread = np.maximum(
+            6.0 * np.median(
+                np.abs(trusted_shape_states[:, 4:] - shape_center), axis=0
+            ),
+            0.1,
         )
-        shape_positions = []
-        normalized_shapes = {}
         for position in range(len(group)):
-            if not finite[position].all():
+            if not usable[position].all():
                 continue
-            normalized = _normalized_triangle(points[position])
-            shape_error = np.max(np.abs(
-                _shape_signature(normalized) / _shape_signature(template) - 1.0
-            ))
-            if shape_error <= config.seed_shape_error:
-                shape_positions.append(position)
-                normalized_shapes[position] = normalized
-        shape_positions = np.asarray(shape_positions, dtype=int)
-        local_templates = []
-        template_size = _side_lengths(template).mean()
-        for position in range(len(group)):
-            neighbors = shape_positions[
-                np.abs(shape_positions - position) <= config.window_radius
-            ]
-            if not len(neighbors):
-                local_templates.append(None)
-                continue
-            local_template = np.median(
-                np.stack([normalized_shapes[neighbor] for neighbor in neighbors]),
-                axis=0,
-            )
-            local_template *= template_size / _side_lengths(local_template).mean()
-            local_templates.append(local_template)
+            shape = _state_from_triangle(points[position])[4:]
+            if np.all(np.abs(shape - shape_center) <= shape_spread):
+                state_measurements[position, 4:] = shape
 
-        pose_measurements = np.full((len(group), 4), np.nan)
-        measurement_mask = np.zeros(len(group), dtype=bool)
+        preliminary_shape = _smooth_state_measurements(state_measurements)
         for position in range(len(group)):
-            anchors = np.flatnonzero(confident[position])
-            if len(anchors) == 2:
-                fitted = _fit_similarity(template, points[position], anchors)
-            elif seed[position]:
-                fitted = points[position]
-            else:
+            anchors = np.flatnonzero(usable[position])
+            if len(anchors) < 2 or not np.isfinite(preliminary_shape[position, 4:]).all():
                 continue
-            pose_measurements[position] = _pose_from_triangle(template, fitted)
-            measurement_mask[position] = True
+            reference_state = np.array([
+                0.0, 0.0, 0.0, 0.0,
+                preliminary_shape[position, 4], preliminary_shape[position, 5],
+            ])
+            reference = _triangle_from_state(reference_state)
+            fitted = _fit_similarity(reference, points[position], anchors)
+            state_measurements[position, :4] = _state_from_triangle(fitted)[:4]
 
-        smooth_pose = _smooth_pose_measurements(pose_measurements)
+        smooth_state = _smooth_state_measurements(state_measurements)
+        smooth_state[:, 4:] = np.clip(
+            smooth_state[:, 4:],
+            shape_center - shape_spread,
+            shape_center + shape_spread,
+        )
         positions = np.arange(len(group))
+        measurement_mask = np.isfinite(state_measurements[:, :4]).all(axis=1)
         before = np.maximum.accumulate(
             np.where(measurement_mask, positions, -100000)
         )
@@ -383,15 +438,23 @@ def add_rigid_head_correction(trajectories_df: pd.DataFrame,
                 continue
 
             complete = finite[position].all()
-            local_template = local_templates[position]
+            basic_candidate = not complete or low_probability[position].any()
+            if not near_measurement[position] or not np.isfinite(smooth_state[position]).all():
+                _write_output(
+                    output, output_position, observed,
+                    "kalman_unresolved" if basic_candidate else "raw_unverified_triangle",
+                    np.nan, n_observations, False
+                )
+                continue
+
+            predicted = _triangle_from_state(smooth_state[position])
             shape_problem = False
-            if complete and local_template is not None:
+            if complete:
                 shape_error = np.max(np.abs(
-                    _shape_signature(observed) / _shape_signature(local_template) - 1.0
+                    _shape_signature(observed) / _shape_signature(predicted) - 1.0
                 ))
                 shape_problem = shape_error > config.suspicious_shape_error
-            candidate = not complete or low_probability[position].any() or shape_problem
-
+            candidate = basic_candidate or shape_problem
             if not candidate:
                 _write_output(
                     output, output_position, observed, "raw_good_triangle",
@@ -399,16 +462,6 @@ def add_rigid_head_correction(trajectories_df: pd.DataFrame,
                 )
                 continue
 
-            if not near_measurement[position] or not np.isfinite(smooth_pose[position]).all():
-                _write_output(
-                    output, output_position, observed,
-                    "kalman_unresolved" if candidate else "raw_unverified_triangle",
-                    np.nan, n_observations, False
-                )
-                continue
-
-            pose_template = local_template if local_template is not None else template
-            predicted = _triangle_from_pose(pose_template, smooth_pose[position])
             head_size = max(float(_side_lengths(predicted).mean()), 1e-6)
             residuals = np.full(len(LANDMARKS), np.inf)
             residuals[finite[position]] = np.linalg.norm(
@@ -429,19 +482,14 @@ def add_rigid_head_correction(trajectories_df: pd.DataFrame,
                 continue
 
             anchors = np.flatnonzero(usable[position] & ~bad)
-            if not len(anchors):
-                _write_output(
-                    output, output_position, observed, "kalman_unresolved",
-                    float(np.sqrt(np.mean(residuals ** 2))),
-                    0, False
-                )
-                continue
             if len(anchors) >= 2:
-                corrected_points = _fit_similarity(pose_template, observed, anchors)
-            else:
+                corrected_points = _fit_similarity(predicted, observed, anchors)
+            elif len(anchors) == 1:
                 corrected_points = predicted + (
                     observed[anchors[0]] - predicted[anchors[0]]
                 )
+            else:
+                corrected_points = predicted
             changed = bad
             changed_points = ", ".join(
                 LANDMARKS[i] for i in np.flatnonzero(changed)
@@ -450,7 +498,8 @@ def add_rigid_head_correction(trajectories_df: pd.DataFrame,
                 np.sum((corrected_points - predicted) ** 2, axis=1)
             )) / head_size)
             method = (
-                "kalman_missing" if not complete
+                "kalman_no_anchor" if not len(anchors)
+                else "kalman_missing" if not complete
                 else "kalman_low_confidence" if low_probability[position].any()
                 else "kalman_geometry"
             )
